@@ -50,9 +50,19 @@ export function registerFileHandlers(getWin: () => BrowserWindow | null): void {
   });
 
   // ── Data paging (drives AG Grid infinite row model) ───────────────────────
-  ipcMain.handle('data:getPage', (_event, offset: number, limit: number) =>
-    pythonBridge.execute('get_page', { offset, limit }),
-  );
+  // Python returns rows_raw (a JSON string from Polars' Rust serializer) to
+  // avoid Python dict allocation.  We parse it here in the main process so
+  // the renderer receives the normal { rows, total } shape.
+  ipcMain.handle('data:getPage', async (_event, offset: number, limit: number) => {
+    const result = await pythonBridge.execute<{ rows_raw?: string; rows?: unknown[]; total: number }>(
+      'get_page', { offset, limit },
+    );
+    if (result?.rows_raw != null) {
+      result.rows = JSON.parse(result.rows_raw);
+      delete result.rows_raw;
+    }
+    return result;
+  });
 
   ipcMain.handle('data:getVariables', () =>
     pythonBridge.execute('get_variables', {}),

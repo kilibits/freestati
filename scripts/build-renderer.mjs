@@ -1,4 +1,4 @@
-import { build } from 'esbuild';
+import { build, context } from 'esbuild';
 import { copyFileSync, mkdirSync, existsSync, readdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -7,8 +7,10 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const out = join(root, 'dist', 'renderer');
 mkdirSync(out, { recursive: true });
 
-// Bundle TypeScript renderer → single JS file
-await build({
+const isWatch = process.argv.includes('--watch');
+
+/** @type {import('esbuild').BuildOptions} */
+const config = {
   entryPoints: [join(root, 'src/renderer/renderer.ts')],
   bundle: true,
   outfile: join(out, 'renderer.js'),
@@ -17,20 +19,31 @@ await build({
   format: 'esm',
   sourcemap: true,
   minify: false,
-});
+};
 
-// Static files
-copyFileSync(join(root, 'src/renderer/index.html'), join(out, 'index.html'));
-copyFileSync(join(root, 'src/renderer/styles.css'), join(out, 'styles.css'));
-
-// Copy AG Grid CSS from node_modules
-const agStylesDir = join(root, 'node_modules/ag-grid-community/styles');
-if (existsSync(agStylesDir)) {
-  for (const file of readdirSync(agStylesDir)) {
-    if (file.endsWith('.css')) {
-      copyFileSync(join(agStylesDir, file), join(out, file));
-    }
-  }
+async function copyAssets() {
+  // Static files
+  copyFileSync(join(root, 'src/renderer/index.html'), join(out, 'index.html'));
+  copyFileSync(join(root, 'src/renderer/styles.css'), join(out, 'styles.css'));
 }
 
-console.log('Renderer build complete →', out);
+if (isWatch) {
+  const ctx = await context({
+    ...config,
+    plugins: [{
+      name: 'assets-copier',
+      setup(build) {
+        build.onEnd(async () => {
+          await copyAssets();
+          console.log('Renderer rebuild complete, assets copied.');
+        });
+      }
+    }]
+  });
+  await ctx.watch();
+  console.log('Watching renderer...');
+} else {
+  await build(config);
+  await copyAssets();
+  console.log('Renderer build complete →', out);
+}

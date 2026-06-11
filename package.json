@@ -5,7 +5,7 @@
   "main": "dist/main/main.js",
   "scripts": {
     "start": "npm run build && electron .",
-    "dev": "concurrently \"npm run watch:main\" \"wait-on dist/main/main.js && electron . --inspect\"",
+    "dev": "npm run build && concurrently \"npm run watch:main\" \"node scripts/build-renderer.mjs --watch\" \"wait-on dist/main/main.js dist/renderer/renderer.js && electron . --inspect\"",
     "build": "npm run build:main && npm run build:renderer",
     "build:main": "tsc -p tsconfig.main.json",
     "build:renderer": "node scripts/build-renderer.mjs",
@@ -28,6 +28,7 @@
     "wait-on": "^7.2.0"
   },
   "dependencies": {
+    "@msgpack/msgpack": "^3.0.0",
     "electron-updater": "^6.2.1"
   },
   "build": {

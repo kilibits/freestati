@@ -5,11 +5,12 @@ import {
   themeBalham,
 } from 'ag-grid-community';
 import { dataStore } from '../stores/dataStore';
-import type { Variable } from '../types/dataset';
+import type { Variable, Alignment } from '../types/dataset';
 
 const MEASURE_OPTIONS = ['scale', 'ordinal', 'nominal'];
 const ROLE_OPTIONS = ['input', 'target', 'both', 'none', 'partition', 'split'];
 const TYPE_OPTIONS = ['numeric', 'string', 'date'];
+const ALIGN_OPTIONS: Alignment[] = ['left', 'center', 'right'];
 
 const COL_DEFS: ColDef<Variable>[] = [
   { field: 'name', headerName: 'Name', width: 130, editable: true },
@@ -22,8 +23,42 @@ const COL_DEFS: ColDef<Variable>[] = [
     cellEditorParams: { values: TYPE_OPTIONS },
   },
   { field: 'width', headerName: 'Width', width: 70, editable: true, type: 'numericColumn' },
-  { field: 'decimals', headerName: 'Decimals', width: 90, editable: true, type: 'numericColumn' },
-  { field: 'label', headerName: 'Label', flex: 1, editable: true },
+  { field: 'decimals', headerName: 'Decimals', width: 80, editable: true, type: 'numericColumn' },
+  { field: 'label', headerName: 'Label', width: 250, editable: true },
+  {
+    headerName: 'Values',
+    width: 120,
+    valueGetter: (p) => {
+      const labels = p.data?.valueLabels;
+      if (!labels) return 'None';
+      const keys = Object.keys(labels);
+      if (keys.length === 0) return 'None';
+      return `{${keys[0]}=${labels[keys[0]]}, ...}`;
+    },
+    tooltipValueGetter: (p) => {
+      const labels = p.data?.valueLabels;
+      if (!labels) return '';
+      return Object.entries(labels).map(([k, v]) => `${k}: ${v}`).join('\n');
+    },
+  },
+  {
+    headerName: 'Missing',
+    width: 100,
+    valueGetter: (p) => {
+      const missing = p.data?.missingValues;
+      if (!missing || missing.length === 0) return 'None';
+      return missing.join(', ');
+    },
+  },
+  { field: 'columns', headerName: 'Columns', width: 80, editable: true, type: 'numericColumn' },
+  {
+    field: 'align',
+    headerName: 'Align',
+    width: 80,
+    editable: true,
+    cellEditor: 'agSelectCellEditor',
+    cellEditorParams: { values: ALIGN_OPTIONS },
+  },
   {
     field: 'measureLevel',
     headerName: 'Measure',
@@ -84,6 +119,7 @@ export class VariableView {
 
   private onStoreChange(): void {
     const { variables } = dataStore.get();
+    console.log('[VariableView] onStoreChange, variables:', variables.length);
     this.api?.setGridOption('rowData', [...variables]);
   }
 

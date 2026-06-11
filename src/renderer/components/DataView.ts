@@ -27,9 +27,9 @@ export class DataView {
     this.api = createGrid(this.container, {
       theme: themeBalham.withParams({ accentColor: '#6366f1' }),
       rowModelType: 'infinite',
-      cacheBlockSize: 100,
-      maxBlocksInCache: 20,
-      infiniteInitialRowCount: 0,
+      cacheBlockSize: 500,
+      maxBlocksInCache: 8,
+      infiniteInitialRowCount: 100,
       columnDefs: [],
       defaultColDef: {
         resizable: true,
@@ -43,7 +43,9 @@ export class DataView {
         const col = event.colDef.field ?? '';
         const value = event.newValue;
         // 1-based row number stored as __row__
-        const caseNum = (event.data as Record<string, unknown>)['__row__'] as number;
+        const data = event.data as Record<string, unknown>;
+        if (!data || !data['__row__']) return;
+        const caseNum = data['__row__'] as number;
         window.electron.data.updateCell(caseNum, col, value).then(() => {
           dataStore.setModified(true);
         });
@@ -57,9 +59,12 @@ export class DataView {
 
   private onStoreChange(): void {
     const state = dataStore.get();
+    console.log('[DataView] onStoreChange, loaded:', state.loaded, 'rowCount:', state.rowCount);
     if (!state.loaded) {
-      this.api?.setGridOption('columnDefs', []);
-      this.api?.setGridOption('datasource', undefined);
+      this.api?.updateGridOptions({
+        columnDefs: [],
+        datasource: undefined,
+      });
       return;
     }
     this.applyDataset(state.variables, state.rowCount);
@@ -67,6 +72,7 @@ export class DataView {
 
   private applyDataset(variables: Variable[], rowCount: number): void {
     if (!this.api) return;
+    console.log('[DataView] applyDataset, rowCount:', rowCount, 'vars:', variables.length);
 
     const colDefs: ColDef[] = [
       {
@@ -93,7 +99,10 @@ export class DataView {
           if (label) return label;
           if (v.type === 'numeric' && v.decimals >= 0) {
             const num = Number(params.value);
-            return isNaN(num) ? params.value : num.toFixed(v.decimals);
+            if (isNaN(num)) return params.value;
+            // If it's an integer and not "clearly a float", don't show decimals
+            if (num % 1 === 0) return num.toFixed(0);
+            return num.toFixed(v.decimals);
           }
           return String(params.value);
         },
@@ -103,24 +112,28 @@ export class DataView {
     const datasource: IDatasource = {
       rowCount,
       getRows: (params: IGetRowsParams) => {
+        console.log('[DataView] getRows, start:', params.startRow, 'end:', params.endRow);
         const offset = params.startRow;
         const limit = params.endRow - params.startRow;
         window.electron.data
           .getPage(offset, limit)
-          .then(({ rows, total }) => {
+          .then(({ rows, total }: { rows: Record<string, unknown>[]; total: number }) => {
             params.successCallback(rows, total);
           })
-          .catch((err) => {
+          .catch((err: unknown) => {
             console.error('[DataView] getPage failed:', err);
             params.failCallback();
           });
       },
     };
 
-    this.api.setGridOption('columnDefs', colDefs);
-    // Setting a new datasource resets the infinite cache and triggers the first load
-    this.api.setGridOption('datasource', datasource);
-    this.api.purgeInfiniteCache();
+    this.api.updateGridOptions({
+      columnDefs: colDefs,
+      datasource: datasource,
+    });
+    
+    // Explicitly refresh the cache to ensure the new datasource is used immediately
+    this.api.refreshInfiniteCache();
   }
 
   /** Called externally after variables are refreshed from VariableView edits. */
