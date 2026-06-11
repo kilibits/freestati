@@ -1,16 +1,15 @@
 {
   "name": "freestats",
   "version": "1.0.0",
-  "description": "FreeStats Electron App",
+  "description": "FreeStats — free, cross-platform statistical analysis",
   "main": "dist/main/main.js",
   "scripts": {
     "start": "npm run build && electron .",
-    "dev": "concurrently \"npm run watch:main\" \"npm run watch:renderer\" \"wait-on dist/main/main.js && electron . --inspect\"",
+    "dev": "concurrently \"npm run watch:main\" \"wait-on dist/main/main.js && electron . --inspect\"",
     "build": "npm run build:main && npm run build:renderer",
     "build:main": "tsc -p tsconfig.main.json",
-    "build:renderer": "tsc -p tsconfig.renderer.json && copyfiles -u 2 \"src/renderer/*.html\" \"src/renderer/*.css\" dist/renderer",
+    "build:renderer": "node scripts/build-renderer.mjs",
     "watch:main": "tsc -p tsconfig.main.json --watch",
-    "watch:renderer": "tsc -p tsconfig.renderer.json --watch",
     "package": "npm run build && electron-builder --publish never",
     "package:win": "npm run build && electron-builder --win --publish never",
     "package:mac": "npm run build && electron-builder --mac --publish never",
@@ -19,8 +18,10 @@
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
+    "ag-grid-community": "^33.0.0",
     "concurrently": "^8.2.2",
     "copyfiles": "^2.4.1",
+    "esbuild": "^0.23.0",
     "electron": "^31.0.0",
     "electron-builder": "^24.13.3",
     "typescript": "^5.5.2",
@@ -41,7 +42,9 @@
       "dist/**/*",
       "!dist/**/*.map"
     ],
-    "extraResources": [],
+    "extraResources": [
+      { "from": "src/main/python", "to": "python" }
+    ],
     "win": {
       "target": [
         { "target": "nsis", "arch": ["x64", "arm64"] },
@@ -67,9 +70,7 @@
       "gatekeeperAssess": false,
       "artifactName": "${productName}-${version}-${arch}.${ext}"
     },
-    "dmg": {
-      "sign": false
-    },
+    "dmg": { "sign": false },
     "linux": {
       "target": [
         { "target": "AppImage", "arch": ["x64", "arm64"] },

@@ -1,18 +1,51 @@
 import { contextBridge, ipcRenderer } from 'electron';
 
-// Expose a safe, narrow API surface to the renderer via window.electron
 contextBridge.exposeInMainWorld('electron', {
+  // ── App info ──────────────────────────────────────────────────────────────
   getVersion: (): Promise<string> => ipcRenderer.invoke('app:getVersion'),
   getPlatform: (): Promise<string> => ipcRenderer.invoke('app:getPlatform'),
   openExternal: (url: string): Promise<void> => ipcRenderer.invoke('app:openExternal', url),
 
+  // ── File operations ───────────────────────────────────────────────────────
+  file: {
+    open: () => ipcRenderer.invoke('file:open'),
+    save: (filePath: string) => ipcRenderer.invoke('file:save', filePath),
+    saveAs: () => ipcRenderer.invoke('file:saveAs'),
+  },
+
+  // ── Dataset data access ───────────────────────────────────────────────────
+  data: {
+    getPage: (offset: number, limit: number) =>
+      ipcRenderer.invoke('data:getPage', offset, limit),
+    getVariables: () => ipcRenderer.invoke('data:getVariables'),
+    setVariableMeta: (varName: string, meta: Record<string, unknown>) =>
+      ipcRenderer.invoke('data:setVariableMeta', varName, meta),
+    updateCell: (row: number, col: string, value: unknown) =>
+      ipcRenderer.invoke('data:updateCell', row, col, value),
+  },
+
+  // ── Generic analysis pass-through ─────────────────────────────────────────
+  python: {
+    execute: <T = unknown>(type: string, args?: Record<string, unknown>): Promise<T> =>
+      ipcRenderer.invoke('python:execute', type, args ?? {}),
+  },
+
+  // ── Native menu events ────────────────────────────────────────────────────
+  menu: {
+    on: (channel: string, cb: () => void): (() => void) => {
+      ipcRenderer.on(channel, cb);
+      return () => ipcRenderer.removeListener(channel, cb);
+    },
+  },
+
+  // ── Auto-updater ──────────────────────────────────────────────────────────
   updater: {
     installUpdate: (): Promise<void> => ipcRenderer.invoke('updater:installUpdate'),
-    onUpdateAvailable: (cb: () => void) => {
+    onUpdateAvailable: (cb: () => void): (() => void) => {
       ipcRenderer.on('updater:updateAvailable', cb);
       return () => ipcRenderer.removeListener('updater:updateAvailable', cb);
     },
-    onUpdateDownloaded: (cb: () => void) => {
+    onUpdateDownloaded: (cb: () => void): (() => void) => {
       ipcRenderer.on('updater:updateDownloaded', cb);
       return () => ipcRenderer.removeListener('updater:updateDownloaded', cb);
     },

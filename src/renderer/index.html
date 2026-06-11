@@ -3,7 +3,6 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <!-- CSP: no inline scripts, no remote resources unless explicitly allowed -->
   <meta http-equiv="Content-Security-Policy"
         content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;" />
   <title>FreeStats</title>
@@ -11,30 +10,34 @@
 </head>
 <body>
   <div id="app">
-    <header class="titlebar">
-      <span class="app-name">FreeStats</span>
-    </header>
 
-    <main class="content">
-      <h1>Welcome to FreeStats</h1>
-      <p class="subtitle">Electron + TypeScript boilerplate</p>
+    <!-- macOS traffic-light drag region / title bar -->
+    <div class="titlebar" id="titlebar">
+      <span class="titlebar-title">FreeStats</span>
+    </div>
 
-      <div class="info-grid">
-        <div class="info-card">
-          <span class="label">Version</span>
-          <span class="value" id="app-version">—</span>
-        </div>
-        <div class="info-card">
-          <span class="label">Platform</span>
-          <span class="value" id="platform">—</span>
-        </div>
-      </div>
+    <!-- Toolbar -->
+    <div class="toolbar">
+      <button id="btn-new"  class="toolbar-btn" title="New Dataset (Ctrl+N)">New</button>
+      <button id="btn-open" class="toolbar-btn" title="Open File (Ctrl+O)">Open</button>
+      <button id="btn-save" class="toolbar-btn" title="Save (Ctrl+S)">Save</button>
+    </div>
 
-      <div id="update-banner" class="update-banner hidden">
-        <span id="update-message"></span>
-        <button id="install-update" class="hidden">Restart &amp; Install</button>
-      </div>
-    </main>
+    <!-- Main content: Data View / Variable View panes -->
+    <div class="main-content">
+      <div id="pane-data"     class="view-pane" style="display:flex"></div>
+      <div id="pane-variable" class="view-pane" style="display:none"></div>
+    </div>
+
+    <!-- Bottom tab bar (SPSS-style) -->
+    <div class="tab-bar">
+      <button class="tab-btn active" data-view="data">Data View</button>
+      <button class="tab-btn"        data-view="variable">Variable View</button>
+    </div>
+
+    <!-- Status bar host -->
+    <div id="status-bar-host"></div>
+
   </div>
 
   <script type="module" src="renderer.js"></script>
