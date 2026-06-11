@@ -59,7 +59,6 @@ export class DataView {
 
   private onStoreChange(): void {
     const state = dataStore.get();
-    console.log('[DataView] onStoreChange, loaded:', state.loaded, 'rowCount:', state.rowCount);
     if (!state.loaded) {
       this.api?.updateGridOptions({
         columnDefs: [],
@@ -72,7 +71,6 @@ export class DataView {
 
   private applyDataset(variables: Variable[], rowCount: number): void {
     if (!this.api) return;
-    console.log('[DataView] applyDataset, rowCount:', rowCount, 'vars:', variables.length);
 
     const colDefs: ColDef[] = [
       {
@@ -112,7 +110,6 @@ export class DataView {
     const datasource: IDatasource = {
       rowCount,
       getRows: (params: IGetRowsParams) => {
-        console.log('[DataView] getRows, start:', params.startRow, 'end:', params.endRow);
         const offset = params.startRow;
         const limit = params.endRow - params.startRow;
         window.electron.data

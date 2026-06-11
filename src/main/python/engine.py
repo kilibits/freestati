@@ -22,11 +22,9 @@ def _log(msg: str) -> None:
 try:
     import polars as pl
     import msgpack
-    import pandas as pd
-    import numpy as np
 except ImportError as e:
     _log(f"CRITICAL: Missing dependency: {e}")
-    _log("Please run: pip install polars msgpack pandas numpy pyreadstat openpyxl")
+    _log("Please run: pip install polars msgpack pandas pyreadstat openpyxl")
     sys.exit(1)
 
 # ── Global state ──────────────────────────────────────────────────────────────
@@ -80,22 +78,35 @@ def _send_raw_rows(msg_id: str, rows_json: str, total: int) -> None:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+# Inference scans only the first _SAMPLE_N rows.  Type/measure inference is a
+# display heuristic, not a statistical result, so a sample keeps load time O(cols)
+# instead of O(rows × cols) on tall datasets.
+_SAMPLE_N = 10_000
+
+
 def _infer_measure(series: pl.Series) -> str:
-    if series.dtype.is_numeric():
-        try:
-            return "ordinal" if series.n_unique() <= 10 else "scale"
-        except Exception:
-            return "scale"
-    return "nominal"
+    if not series.dtype.is_numeric():
+        return "nominal"
+    try:
+        # >10 distinct values in the sample ⇒ already scale; sample bounds the cost
+        return "ordinal" if series.head(_SAMPLE_N).n_unique() <= 10 else "scale"
+    except Exception:
+        return "scale"
 
 
 def _infer_decimals(series: pl.Series) -> int:
-    if not series.dtype.is_numeric():
+    dtype = series.dtype
+    if not dtype.is_numeric():
+        return 0
+    # Integer dtypes never need decimals — no scan required
+    if dtype in (pl.Int8, pl.Int16, pl.Int32, pl.Int64,
+                 pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64):
         return 0
     try:
-        if series.null_count() == len(series):
+        sample = series.head(_SAMPLE_N).drop_nulls()
+        if sample.is_empty():
             return 0
-        return 0 if (series.drop_nulls() == series.drop_nulls().floor()).all() else 2
+        return 0 if (sample == sample.floor()).all() else 2
     except Exception:
         return 2
 
@@ -246,8 +257,9 @@ def cmd_get_page(args: dict) -> object:
     # Replace NaN/Inf so Polars produces valid JSON
     chunk = _sanitise_floats(chunk)
 
-    # Polars serialises directly in Rust — zero Python dict allocation
-    rows_json = chunk.write_json(row_oriented=True)
+    # Polars serialises directly in Rust — zero Python dict allocation.
+    # write_json() emits a row-oriented JSON array (list of row objects) in 1.x.
+    rows_json = chunk.write_json()
 
     _send_raw_rows(args.get("__msg_id__", "?"), rows_json, total)
     return _SENT

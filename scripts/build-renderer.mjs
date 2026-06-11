@@ -9,6 +9,8 @@ mkdirSync(out, { recursive: true });
 
 const isWatch = process.argv.includes('--watch');
 
+// Watch mode = dev iteration: skip minify, emit sourcemaps for debugging.
+// Plain build (used by `package`) = production: minify, no sourcemap.
 /** @type {import('esbuild').BuildOptions} */
 const config = {
   entryPoints: [join(root, 'src/renderer/renderer.ts')],
@@ -17,8 +19,8 @@ const config = {
   platform: 'browser',
   target: 'chrome120',
   format: 'esm',
-  sourcemap: true,
-  minify: false,
+  sourcemap: isWatch,
+  minify: !isWatch,
 };
 
 async function copyAssets() {

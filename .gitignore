@@ -6,3 +6,13 @@ release/
 *.d.ts.map
 .DS_Store
 Thumbs.db
+
+# Compiled TypeScript leaking into the source tree (src is .ts only)
+src/**/*.js
+src/**/*.d.ts
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/

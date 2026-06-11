@@ -119,7 +119,6 @@ export class VariableView {
 
   private onStoreChange(): void {
     const { variables } = dataStore.get();
-    console.log('[VariableView] onStoreChange, variables:', variables.length);
     this.api?.setGridOption('rowData', [...variables]);
   }
 
