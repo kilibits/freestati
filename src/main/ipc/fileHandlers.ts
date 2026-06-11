@@ -1,5 +1,10 @@
 import { BrowserWindow, dialog, ipcMain } from 'electron';
+import { promises as fsp } from 'fs';
+import { homedir } from 'os';
+import path from 'path';
 import { pythonBridge } from './pythonBridge';
+
+const DATA_EXTS = new Set(['.tab', '.tsv', '.csv', '.xlsx', '.xls', '.sav', '.dta', '.sas7bdat']);
 
 export function registerFileHandlers(getWin: () => BrowserWindow | null): void {
   ipcMain.handle('file:open', async () => {
@@ -65,4 +70,33 @@ export function registerFileHandlers(getWin: () => BrowserWindow | null): void {
   ipcMain.handle('python:execute', (_event, type: string, args: Record<string, unknown>) =>
     pythonBridge.execute(type, args),
   );
+
+  // ── File-system browsing (for the sidebar explorer) ───────────────────────
+  ipcMain.handle('fs:getHomePath', () => homedir());
+
+  ipcMain.handle('fs:openFolder', async () => {
+    const win = getWin();
+    const { filePaths, canceled } = await dialog.showOpenDialog(
+      win ?? ({} as BrowserWindow),
+      { title: 'Open Folder', properties: ['openDirectory'] },
+    );
+    return canceled ? null : (filePaths[0] ?? null);
+  });
+
+  ipcMain.handle('fs:readDir', async (_event, dirPath: string) => {
+    const entries = await fsp.readdir(dirPath, { withFileTypes: true });
+    return entries
+      .filter(e => e.isDirectory() || DATA_EXTS.has(path.extname(e.name).toLowerCase()))
+      .sort((a, b) => {
+        // Directories first, then files alphabetically
+        if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1;
+        return a.name.localeCompare(b.name);
+      })
+      .map(e => ({
+        name: e.name,
+        path: path.join(dirPath, e.name),
+        isDirectory: e.isDirectory(),
+        ext: path.extname(e.name).toLowerCase(),
+      }));
+  });
 }

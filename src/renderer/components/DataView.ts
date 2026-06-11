@@ -4,6 +4,7 @@ import {
   GridApi,
   IDatasource,
   IGetRowsParams,
+  InfiniteRowModelModule,
   ModuleRegistry,
   createGrid,
   themeBalham,
@@ -11,7 +12,8 @@ import {
 import { dataStore } from '../stores/dataStore';
 import type { Variable } from '../types/dataset';
 
-ModuleRegistry.registerModules([AllCommunityModule]);
+// AllCommunityModule does NOT include InfiniteRowModelModule in v33 — register both
+ModuleRegistry.registerModules([AllCommunityModule, InfiniteRowModelModule]);
 
 export class DataView {
   private container!: HTMLElement;
@@ -108,12 +110,17 @@ export class DataView {
           .then(({ rows, total }) => {
             params.successCallback(rows, total);
           })
-          .catch(() => params.failCallback());
+          .catch((err) => {
+            console.error('[DataView] getPage failed:', err);
+            params.failCallback();
+          });
       },
     };
 
     this.api.setGridOption('columnDefs', colDefs);
+    // Setting a new datasource resets the infinite cache and triggers the first load
     this.api.setGridOption('datasource', datasource);
+    this.api.purgeInfiniteCache();
   }
 
   /** Called externally after variables are refreshed from VariableView edits. */

@@ -145,6 +145,8 @@ function buildMenu(): void {
     {
       label: 'View',
       submenu: [
+        { label: 'File Explorer', accelerator: 'CmdOrCtrl+Shift+E', click: send('menu:view:explorer') },
+        { type: 'separator' },
         { label: 'Data View', accelerator: 'CmdOrCtrl+D', click: send('menu:view:dataView') },
         { label: 'Variable View', accelerator: 'CmdOrCtrl+Shift+D', click: send('menu:view:variableView') },
         { type: 'separator' },

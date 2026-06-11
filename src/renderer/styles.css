@@ -1,4 +1,4 @@
-/* ── Reset & variables ──────────────────────────────────────────────────────── */
+/* ── Reset & variables ────────────────────────────────────────────────────── */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 :root {
@@ -8,12 +8,15 @@
   --border:       #2a2d3e;
   --text:         #e2e8f0;
   --text-muted:   #64748b;
+  --text-faint:   #3d4466;
   --accent:       #6366f1;
   --accent-hover: #4f52d3;
+  --danger:       #ef4444;
   --tab-h:        32px;
   --toolbar-h:    38px;
   --titlebar-h:   38px;
   --status-h:     24px;
+  --sidebar-w:    240px;
   --font:         -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
 }
 
@@ -27,24 +30,20 @@ html, body, #app {
   overflow: hidden;
 }
 
-#app {
-  display: flex;
-  flex-direction: column;
-}
+#app { display: flex; flex-direction: column; }
 
-/* ── Titlebar ───────────────────────────────────────────────────────────────── */
+/* ── Titlebar ─────────────────────────────────────────────────────────────── */
 .titlebar {
   height: var(--titlebar-h);
   -webkit-app-region: drag;
   display: flex;
   align-items: center;
-  padding: 0 16px 0 80px; /* 80px clears macOS traffic lights */
+  padding: 0 16px 0 80px;
   background: var(--surface);
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
   user-select: none;
 }
-
 .titlebar-title {
   font-size: 12px;
   font-weight: 600;
@@ -53,7 +52,7 @@ html, body, #app {
   text-transform: uppercase;
 }
 
-/* ── Toolbar ────────────────────────────────────────────────────────────────── */
+/* ── Toolbar ──────────────────────────────────────────────────────────────── */
 .toolbar {
   height: var(--toolbar-h);
   display: flex;
@@ -65,10 +64,15 @@ html, body, #app {
   flex-shrink: 0;
   -webkit-app-region: no-drag;
 }
-
+.toolbar-sep {
+  width: 1px;
+  height: 18px;
+  background: var(--border);
+  margin: 0 4px;
+}
 .toolbar-btn {
   height: 26px;
-  padding: 0 12px;
+  padding: 0 10px;
   background: var(--surface);
   color: var(--text);
   border: 1px solid var(--border);
@@ -77,27 +81,149 @@ html, body, #app {
   font-family: var(--font);
   cursor: pointer;
   transition: background 0.12s, border-color 0.12s;
+  white-space: nowrap;
+}
+.toolbar-btn:hover   { background: var(--accent); border-color: var(--accent); }
+.toolbar-btn.active  { background: var(--accent); border-color: var(--accent); }
+
+/* ── Layout (sidebar + content) ───────────────────────────────────────────── */
+.layout {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+  --actual-sidebar-w: var(--sidebar-w);
+}
+.layout.sidebar-hidden .sidebar        { width: 0; min-width: 0; overflow: hidden; border: none; }
+.layout.sidebar-hidden .sidebar-resizer { display: none; }
+
+/* ── Sidebar ──────────────────────────────────────────────────────────────── */
+.sidebar {
+  width: var(--sidebar-w);
+  min-width: 160px;
+  max-width: 480px;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  overflow: hidden;
+  transition: width 0.18s ease;
 }
 
-.toolbar-btn:hover {
-  background: var(--accent);
-  border-color: var(--accent);
+/* ── Sidebar resize handle ────────────────────────────────────────────────── */
+.sidebar-resizer {
+  width: 4px;
+  cursor: col-resize;
+  background: transparent;
+  flex-shrink: 0;
+  transition: background 0.12s;
+}
+.sidebar-resizer:hover { background: var(--accent); }
+
+/* ── File Explorer internals ──────────────────────────────────────────────── */
+.file-explorer {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+.fe-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 10px;
+  height: 34px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.fe-folder-name {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+.fe-open-btn {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+.fe-open-btn:hover { color: var(--text); background: var(--surface2); }
+
+.fe-list {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+.fe-list::-webkit-scrollbar { width: 6px; }
+.fe-list::-webkit-scrollbar-track { background: transparent; }
+.fe-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+.fe-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding-right: 8px;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.fe-row:hover { background: var(--surface2); }
+.fe-row.fe-active { background: color-mix(in srgb, var(--accent) 20%, transparent); }
+.fe-row.fe-active .fe-label { color: var(--accent); }
+
+.fe-icon {
+  font-size: 11px;
+  flex-shrink: 0;
+  color: var(--text-muted);
+  width: 16px;
+  text-align: center;
+}
+.fe-label {
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text);
+}
+.fe-dir .fe-label { color: var(--text); }
+.fe-file .fe-label { color: #94a3b8; }
+
+.fe-message {
+  padding: 12px 14px;
+  font-size: 12px;
+  color: var(--text-muted);
 }
 
-/* ── Main content ───────────────────────────────────────────────────────────── */
+/* ── Content panel ────────────────────────────────────────────────────────── */
+.content-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-width: 0;
+}
 .main-content {
   flex: 1;
   overflow: hidden;
   position: relative;
 }
-
 .view-pane {
   position: absolute;
   inset: 0;
   flex-direction: column;
 }
-
-/* AG Grid containers */
 .data-view-container,
 .variable-view-container {
   flex: 1;
@@ -105,25 +231,7 @@ html, body, #app {
   width: 100%;
 }
 
-/* AG Grid dark overrides */
-.ag-theme-balham {
-  --ag-background-color: var(--bg);
-  --ag-foreground-color: var(--text);
-  --ag-border-color: var(--border);
-  --ag-header-background-color: var(--surface);
-  --ag-odd-row-background-color: #12151e;
-  --ag-row-hover-color: #1e2235;
-  --ag-selected-row-background-color: #252a40;
-  --ag-font-family: var(--font);
-  --ag-font-size: 13px;
-}
-
-.empty-state {
-  color: var(--text-muted);
-  font-size: 13px;
-}
-
-/* ── Tab bar ────────────────────────────────────────────────────────────────── */
+/* ── Tab bar ──────────────────────────────────────────────────────────────── */
 .tab-bar {
   height: var(--tab-h);
   display: flex;
@@ -134,7 +242,6 @@ html, body, #app {
   padding: 0 6px;
   gap: 2px;
 }
-
 .tab-btn {
   height: 28px;
   padding: 0 16px;
@@ -148,18 +255,10 @@ html, body, #app {
   cursor: pointer;
   transition: color 0.12s, background 0.12s;
 }
+.tab-btn.active { background: var(--bg); color: var(--text); border-color: var(--border); }
+.tab-btn:not(.active):hover { color: var(--text); }
 
-.tab-btn.active {
-  background: var(--bg);
-  color: var(--text);
-  border-color: var(--border);
-}
-
-.tab-btn:not(.active):hover {
-  color: var(--text);
-}
-
-/* ── Status bar ─────────────────────────────────────────────────────────────── */
+/* ── Status bar ───────────────────────────────────────────────────────────── */
 .status-bar {
   height: var(--status-h);
   line-height: var(--status-h);
@@ -173,3 +272,6 @@ html, body, #app {
   text-overflow: ellipsis;
   flex-shrink: 0;
 }
+
+/* ── Empty overlay ────────────────────────────────────────────────────────── */
+.empty-state { color: var(--text-muted); font-size: 13px; }

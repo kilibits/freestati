@@ -11,32 +11,47 @@
 <body>
   <div id="app">
 
-    <!-- macOS traffic-light drag region / title bar -->
-    <div class="titlebar" id="titlebar">
+    <!-- macOS traffic-light / drag region -->
+    <div class="titlebar">
       <span class="titlebar-title">FreeStats</span>
     </div>
 
     <!-- Toolbar -->
     <div class="toolbar">
+      <button id="btn-explorer"    class="toolbar-btn active" title="Toggle File Explorer">⊞</button>
+      <button id="btn-open-folder" class="toolbar-btn"        title="Open Folder in Explorer">📁</button>
+      <div class="toolbar-sep"></div>
       <button id="btn-new"  class="toolbar-btn" title="New Dataset (Ctrl+N)">New</button>
-      <button id="btn-open" class="toolbar-btn" title="Open File (Ctrl+O)">Open</button>
+      <button id="btn-open" class="toolbar-btn" title="Open File (Ctrl+O)">Open…</button>
       <button id="btn-save" class="toolbar-btn" title="Save (Ctrl+S)">Save</button>
     </div>
 
-    <!-- Main content: Data View / Variable View panes -->
-    <div class="main-content">
-      <div id="pane-data"     class="view-pane" style="display:flex"></div>
-      <div id="pane-variable" class="view-pane" style="display:none"></div>
-    </div>
+    <!-- Body: sidebar + main content -->
+    <div id="layout" class="layout">
 
-    <!-- Bottom tab bar (SPSS-style) -->
-    <div class="tab-bar">
-      <button class="tab-btn active" data-view="data">Data View</button>
-      <button class="tab-btn"        data-view="variable">Variable View</button>
-    </div>
+      <!-- Sidebar: File Explorer -->
+      <div id="sidebar" class="sidebar"></div>
 
-    <!-- Status bar host -->
-    <div id="status-bar-host"></div>
+      <!-- Resize handle -->
+      <div id="sidebar-resizer" class="sidebar-resizer"></div>
+
+      <!-- Right panel: data grids + tab bar + status -->
+      <div class="content-panel">
+
+        <div class="main-content">
+          <div id="pane-data"     class="view-pane" style="display:flex"></div>
+          <div id="pane-variable" class="view-pane" style="display:none"></div>
+        </div>
+
+        <div class="tab-bar">
+          <button class="tab-btn active" data-view="data">Data View</button>
+          <button class="tab-btn"        data-view="variable">Variable View</button>
+        </div>
+
+        <div id="status-bar-host"></div>
+
+      </div>
+    </div>
 
   </div>
 

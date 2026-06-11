@@ -24,6 +24,14 @@ contextBridge.exposeInMainWorld('electron', {
       ipcRenderer.invoke('data:updateCell', row, col, value),
   },
 
+  // ── File-system browsing ─────────────────────────────────────────────────
+  fs: {
+    getHomePath: (): Promise<string> => ipcRenderer.invoke('fs:getHomePath'),
+    openFolder: (): Promise<string | null> => ipcRenderer.invoke('fs:openFolder'),
+    readDir: (dirPath: string): Promise<Array<{ name: string; path: string; isDirectory: boolean; ext: string }>> =>
+      ipcRenderer.invoke('fs:readDir', dirPath),
+  },
+
   // ── Generic analysis pass-through ─────────────────────────────────────────
   python: {
     execute: <T = unknown>(type: string, args?: Record<string, unknown>): Promise<T> =>
