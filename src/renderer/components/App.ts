@@ -29,14 +29,14 @@ export class App {
   // ── Sidebar ───────────────────────────────────────────────────────────────
 
   private restoreSidebarState(): void {
-    const saved = localStorage.getItem('freestats:sidebarOpen');
+    const saved = localStorage.getItem('freestati:sidebarOpen');
     this.sidebarOpen = saved !== 'false';
     this.applySidebarState();
   }
 
   private toggleSidebar(): void {
     this.sidebarOpen = !this.sidebarOpen;
-    localStorage.setItem('freestats:sidebarOpen', String(this.sidebarOpen));
+    localStorage.setItem('freestati:sidebarOpen', String(this.sidebarOpen));
     this.applySidebarState();
   }
 

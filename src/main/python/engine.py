@@ -1,5 +1,5 @@
 """
-FreeStats Python statistical engine.
+FreeStati Python statistical engine.
 
 Transport: 4-byte big-endian length prefix + msgpack payload (both directions).
 Concurrency: asyncio event loop + ThreadPoolExecutor for CPU-bound Polars work.

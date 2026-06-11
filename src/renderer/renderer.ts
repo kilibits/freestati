@@ -25,7 +25,7 @@ function initSidebarResizer(): void {
     const delta = e.clientX - startX;
     const newW = Math.max(160, Math.min(480, startW + delta));
     sidebar.style.width = `${newW}px`;
-    localStorage.setItem('freestats:sidebarWidth', String(newW));
+    localStorage.setItem('freestati:sidebarWidth', String(newW));
   });
 
   document.addEventListener('mouseup', () => {
@@ -36,6 +36,6 @@ function initSidebarResizer(): void {
   });
 
   // Restore saved width
-  const saved = localStorage.getItem('freestats:sidebarWidth');
+  const saved = localStorage.getItem('freestati:sidebarWidth');
   if (saved) sidebar.style.width = `${saved}px`;
 }

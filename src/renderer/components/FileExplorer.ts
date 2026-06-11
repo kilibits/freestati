@@ -41,7 +41,7 @@ export class FileExplorer {
   // ── Persistence ────────────────────────────────────────────────────────────
 
   private tryRestoreFolder(): void {
-    const saved = localStorage.getItem('freestats:explorerPath');
+    const saved = localStorage.getItem('freestati:explorerPath');
     if (saved) this.loadRoot(saved);
   }
 
@@ -56,7 +56,7 @@ export class FileExplorer {
 
   private async loadRoot(dirPath: string): Promise<void> {
     this.rootPath = dirPath;
-    localStorage.setItem('freestats:explorerPath', dirPath);
+    localStorage.setItem('freestati:explorerPath', dirPath);
     this.loadingRoot = true;
     this.headerPathEl.textContent = dirPath.split('/').pop() ?? dirPath;
     this.headerPathEl.title = dirPath;

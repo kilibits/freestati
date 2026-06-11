@@ -1,7 +1,7 @@
 {
-  "name": "freestats",
+  "name": "freestati",
   "version": "1.0.0",
-  "description": "FreeStats — free, cross-platform statistical analysis",
+  "description": "FreeStati — free, cross-platform statistical analysis",
   "main": "dist/main/main.js",
   "scripts": {
     "start": "npm run build && electron .",
@@ -32,8 +32,8 @@
     "electron-updater": "^6.2.1"
   },
   "build": {
-    "appId": "com.freestats.app",
-    "productName": "FreeStats",
+    "appId": "com.freestati.app",
+    "productName": "FreeStati",
     "copyright": "Copyright © 2026",
     "directories": {
       "output": "release",

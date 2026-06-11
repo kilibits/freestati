@@ -161,7 +161,7 @@ function buildMenu(): void {
     {
       role: 'help',
       submenu: [
-        { label: 'About FreeStats', click: send('menu:help:about') },
+        { label: 'About FreeStati', click: send('menu:help:about') },
       ],
     },
   ];

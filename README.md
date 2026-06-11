@@ -1,4 +1,4 @@
-# FreeStats
+# FreeStati
 
 A free, open, cross-platform statistical analysis application — an SPSS-style data
 editor and analysis environment built on Electron + TypeScript, powered by a
