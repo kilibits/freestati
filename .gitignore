@@ -10,6 +10,8 @@ Thumbs.db
 # Compiled TypeScript leaking into the source tree (src is .ts only)
 src/**/*.js
 src/**/*.d.ts
+# ...but global.d.ts is hand-written source, not a compiled artifact
+!src/renderer/global.d.ts
 
 # Python
 __pycache__/
