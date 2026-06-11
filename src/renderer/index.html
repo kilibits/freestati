@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <!-- CSP: no inline scripts, no remote resources unless explicitly allowed -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;" />
+  <title>FreeStats</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="app">
+    <header class="titlebar">
+      <span class="app-name">FreeStats</span>
+    </header>
+
+    <main class="content">
+      <h1>Welcome to FreeStats</h1>
+      <p class="subtitle">Electron + TypeScript boilerplate</p>
+
+      <div class="info-grid">
+        <div class="info-card">
+          <span class="label">Version</span>
+          <span class="value" id="app-version">—</span>
+        </div>
+        <div class="info-card">
+          <span class="label">Platform</span>
+          <span class="value" id="platform">—</span>
+        </div>
+      </div>
+
+      <div id="update-banner" class="update-banner hidden">
+        <span id="update-message"></span>
+        <button id="install-update" class="hidden">Restart &amp; Install</button>
+      </div>
+    </main>
+  </div>
+
+  <script type="module" src="renderer.js"></script>
+</body>
+</html>
