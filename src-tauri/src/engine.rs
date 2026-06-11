@@ -29,6 +29,7 @@ pub struct VarMeta {
     pub columns: Option<u32>,
     pub align: Option<String>,
     pub value_labels: Option<HashMap<String, String>>,
+    pub missing_values: Option<Vec<JsonValue>>,
     pub measure_level: Option<String>,
     pub role: Option<String>,
 }
@@ -159,9 +160,14 @@ impl Engine {
         let df = match ext.as_str() {
             "tab" | "tsv" => read_delimited(path, b'\t')?,
             "csv" => read_delimited(path, b',')?,
-            "xlsx" | "xls" | "sav" | "dta" | "sas7bdat" => {
+            "sav" | "zsav" => {
+                let sav = crate::sav::read_sav_file(path)?;
+                self.var_meta = sav.var_meta;
+                sav.df
+            }
+            "xlsx" | "xls" | "dta" | "sas7bdat" => {
                 return Err(format!(
-                    ".{ext} is not yet supported by the native engine (only .tab/.tsv/.csv). \
+                    ".{ext} is not yet supported by the native engine (supported: .tab/.tsv/.csv/.sav). \
                      This format will be restored in a later release."
                 ));
             }
@@ -227,7 +233,7 @@ impl Engine {
                 columns: m.and_then(|m| m.columns).unwrap_or(8),
                 align: m.and_then(|m| m.align.clone()).unwrap_or("left".into()),
                 value_labels: m.and_then(|m| m.value_labels.clone()).unwrap_or_default(),
-                missing_values: vec![],
+                missing_values: m.and_then(|m| m.missing_values.clone()).unwrap_or_default(),
                 measure_level: m
                     .and_then(|m| m.measure_level.clone())
                     .unwrap_or_else(|| infer_measure(series)),

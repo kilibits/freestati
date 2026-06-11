@@ -10,6 +10,7 @@ declare global {
     openExternal(url: string): Promise<void>;
 
     file: {
+      pickOpenPath(): Promise<string | null>;
       open(): Promise<LoadResult | null>;
       save(filePath: string): Promise<{ ok: boolean }>;
       saveAs(): Promise<{ ok: boolean; path: string } | null>;

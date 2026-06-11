@@ -13,6 +13,7 @@ export class App {
   private fileExplorer = new FileExplorer();
   private activeView: ActiveView = 'data';
   private sidebarOpen = true;
+  private loadingTimer: number | null = null;
 
   mount(): void {
     this.dataView.mount(document.getElementById('pane-data')!);
@@ -92,6 +93,30 @@ export class App {
     window.electron.menu.on('menu:view:explorer', () => this.toggleSidebar());
   }
 
+  // ── Loading overlay ─────────────────────────────────────────────────────────
+
+  /** Show after a short delay so fast operations don't flash the overlay. */
+  private showLoading(message: string, delayMs = 150): void {
+    const msgEl = document.getElementById('loading-message');
+    if (msgEl) msgEl.textContent = message;
+    this.clearLoadingTimer();
+    this.loadingTimer = window.setTimeout(() => {
+      document.getElementById('loading-overlay')?.classList.remove('hidden');
+    }, delayMs);
+  }
+
+  private hideLoading(): void {
+    this.clearLoadingTimer();
+    document.getElementById('loading-overlay')?.classList.add('hidden');
+  }
+
+  private clearLoadingTimer(): void {
+    if (this.loadingTimer !== null) {
+      clearTimeout(this.loadingTimer);
+      this.loadingTimer = null;
+    }
+  }
+
   // ── Actions ───────────────────────────────────────────────────────────────
 
   private async newDataset(): Promise<void> {
@@ -103,34 +128,45 @@ export class App {
   }
 
   private async openFile(): Promise<void> {
-    const result = await window.electron.file.open();
-    if (!result) return;
-    if ('error' in result) {
-      alert(`Failed to open file:\n${(result as { error: string }).error}`);
-      return;
-    }
-    dataStore.applyLoadResult(result);
-    this.switchView('data');
+    // Pick the path first (no overlay during the native dialog), then load.
+    const path = await window.electron.file.pickOpenPath();
+    if (path) await this.loadPath(path);
   }
 
-  private async openFilePath(filePath: string): Promise<void> {
+  private openFilePath(filePath: string): Promise<void> {
+    return this.loadPath(filePath);
+  }
+
+  /** Shared load path with a loading indicator and error handling. */
+  private async loadPath(filePath: string): Promise<void> {
+    const name = filePath.split(/[\\/]/).pop() ?? filePath;
+    this.showLoading(`Opening ${name}…`);
     try {
       const result = await window.electron.python.execute<
         import('../types/dataset').LoadResult & { error?: string }
       >('load_file', { path: filePath });
-      if (result.error) { alert(`Error: ${result.error}`); return; }
+      if (result.error) { alert(`Failed to open file:\n${result.error}`); return; }
       dataStore.applyLoadResult(result);
       this.switchView('data');
     } catch (err) {
       alert(`Failed to open file:\n${err}`);
+    } finally {
+      this.hideLoading();
     }
   }
 
   private async save(): Promise<void> {
     const { path } = dataStore.get();
     if (!path) { await this.saveAs(); return; }
-    await window.electron.file.save(path);
-    dataStore.setModified(false);
+    this.showLoading('Saving…');
+    try {
+      await window.electron.file.save(path);
+      dataStore.setModified(false);
+    } catch (err) {
+      alert(`Failed to save file:\n${err}`);
+    } finally {
+      this.hideLoading();
+    }
   }
 
   private async saveAs(): Promise<void> {

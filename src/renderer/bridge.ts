@@ -16,9 +16,10 @@ import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialo
 import type { LoadResult } from './types/dataset';
 
 const DATA_FILTERS = [
-  { name: 'Data Files', extensions: ['tab', 'tsv', 'csv'] },
+  { name: 'Data Files', extensions: ['tab', 'tsv', 'csv', 'sav', 'zsav'] },
   { name: 'Tab-Delimited', extensions: ['tab', 'tsv'] },
   { name: 'CSV', extensions: ['csv'] },
+  { name: 'SPSS', extensions: ['sav', 'zsav'] },
   { name: 'All Files', extensions: ['*'] },
 ];
 
@@ -42,10 +43,16 @@ const electron = {
 
   // ── File operations ─────────────────────────────────────────────────────────
   file: {
-    async open(): Promise<LoadResult | null> {
+    // Dialog only — returns a path so the caller can show a loading indicator
+    // around the (potentially slow) load itself.
+    async pickOpenPath(): Promise<string | null> {
       const path = await openDialog({ multiple: false, filters: DATA_FILTERS });
-      if (typeof path !== 'string') return null;
-      return invoke<LoadResult>('load_file', { path });
+      return typeof path === 'string' ? path : null;
+    },
+    open(): Promise<LoadResult | null> {
+      return this.pickOpenPath().then((path) =>
+        path ? invoke<LoadResult>('load_file', { path }) : null,
+      );
     },
     save: (path: string): Promise<{ ok: boolean }> => invoke('save_file', { path }),
     async saveAs(): Promise<{ ok: boolean; path: string } | null> {

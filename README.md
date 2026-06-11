@@ -23,11 +23,12 @@ alongside `.tsv` and `.csv`.
 |---|---|---|
 | `.tab` / `.tsv` | ✅ | ✅ |
 | `.csv` | ✅ | ✅ |
-| `.xlsx` / `.sav` / `.dta` / `.sas7bdat` | ⏳ roadmap | ⏳ roadmap |
+| `.sav` / `.zsav` (SPSS) | ✅ (incl. variable & value labels, measure) | ⏳ roadmap |
+| `.xlsx` / `.dta` / `.sas7bdat` | ⏳ roadmap | ⏳ roadmap |
 
-> These were supported by the previous Python/pyreadstat engine. Porting them to
-> the Rust engine (e.g. `calamine` for Excel) is on the roadmap; the loader
-> returns a clear message for now.
+> `.sav` is read with the pure-Rust [`ambers`](https://crates.io/crates/ambers)
+> crate. Excel/Stata/SAS reading and SPSS writing are on the roadmap; the loader
+> returns a clear message for unsupported formats.
 
 ## Architecture
 
@@ -144,7 +145,7 @@ scripts/build-renderer.mjs esbuild bundler
 
 ## Roadmap
 
-- Restore `.xlsx` / `.sav` / `.dta` / `.sas7bdat` in the Rust engine
+- Restore `.xlsx` / `.dta` / `.sas7bdat` reading and `.sav` writing in the Rust engine
 - Descriptive statistics, compare means, correlation & regression, nonparametrics
 - Charts (histogram, bar, scatter, box plot)
 - Output viewer for results and pivot tables

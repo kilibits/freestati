@@ -26,6 +26,8 @@ polars = { version = "0.45", default-features = false, features = [
     "strings",
     "round_series",
 ] }
+ambers = "0.4.2"
+arrow = "57"
 
 [profile.release]
 panic = "abort"
