@@ -2,6 +2,7 @@ import {
   AllCommunityModule,
   ColDef,
   GridApi,
+  GridOptions,
   IDatasource,
   IGetRowsParams,
   InfiniteRowModelModule,
@@ -19,24 +20,38 @@ export class DataView {
   private container!: HTMLElement;
   private api: GridApi | null = null;
   private unsub: (() => void) | null = null;
+  // Identity of the dataset currently shown; avoids rebuilding the grid on
+  // unrelated store updates (e.g. the "modified" flag toggling after an edit).
+  private loadedSignature: string | null = null;
 
   mount(container: HTMLElement): void {
     this.container = container;
     this.container.classList.add('data-view-container');
+    // Start with an empty grid (no dataset loaded yet).
+    this.api = createGrid(this.container, this.gridOptions(100, [], undefined));
+    this.unsub = dataStore.subscribe(() => this.onStoreChange());
+  }
 
-    this.api = createGrid(this.container, {
+  // ── Static grid options shared by every (re)build ──────────────────────────
+
+  private gridOptions(
+    cacheBlockSize: number,
+    columnDefs: ColDef[],
+    datasource: IDatasource | undefined,
+  ): GridOptions {
+    return {
       theme: themeBalham.withParams({ accentColor: '#6366f1' }),
       rowModelType: 'infinite',
-      // Block size is tuned per-dataset in applyDataset(): wide frames (1000s of
-      // columns) must use small blocks or the first page would be millions of
-      // cells / tens of MB. 100 is a safe default until a dataset is loaded.
-      cacheBlockSize: 100,
+      // cacheBlockSize is an init-only property in AG Grid, so it can only be
+      // set when the grid is created — that's why a new dataset rebuilds the grid.
+      cacheBlockSize,
       maxBlocksInCache: 10,
       infiniteInitialRowCount: 100,
       // Treat `field` as a literal key. Without this, column names containing a
       // dot (e.g. "Q1.A") are read as nested paths row["Q1"]["A"] → blank cells.
       suppressFieldDotNotation: true,
-      columnDefs: [],
+      columnDefs,
+      datasource,
       defaultColDef: {
         resizable: true,
         sortable: false,
@@ -44,44 +59,74 @@ export class DataView {
         minWidth: 80,
       },
       onCellValueChanged: (event) => {
-        const rowIndex = event.node.rowIndex;
-        if (rowIndex == null) return;
         const col = event.colDef.field ?? '';
-        const value = event.newValue;
-        // 1-based row number stored as __row__
         const data = event.data as Record<string, unknown>;
         if (!data || !data['__row__']) return;
         const caseNum = data['__row__'] as number;
-        window.electron.data.updateCell(caseNum, col, value).then(() => {
+        window.electron.data.updateCell(caseNum, col, event.newValue).then(() => {
           dataStore.setModified(true);
         });
       },
       overlayNoRowsTemplate:
         '<span class="empty-state">No data loaded — use File › Open to load a dataset</span>',
-    });
-
-    this.unsub = dataStore.subscribe(() => this.onStoreChange());
+    };
   }
+
+  // ── Store reactions ────────────────────────────────────────────────────────
 
   private onStoreChange(): void {
     const state = dataStore.get();
+
     if (!state.loaded) {
-      this.api?.updateGridOptions({
-        columnDefs: [],
-        datasource: undefined,
-      });
+      if (this.loadedSignature !== null) {
+        this.loadedSignature = null;
+        this.rebuild(100, [], undefined);
+      }
       return;
     }
-    this.applyDataset(state.variables, state.rowCount);
+
+    const signature = `${state.path ?? ''}|${state.rowCount}|${state.colCount}`;
+    if (signature === this.loadedSignature) {
+      return; // same dataset — a non-structural change (e.g. modified flag)
+    }
+    this.loadedSignature = signature;
+
+    const blockSize = this.blockSizeFor(state.variables.length);
+    this.rebuild(blockSize, this.buildColumnDefs(state.variables), this.buildDatasource(state.rowCount));
   }
 
-  private applyDataset(variables: Variable[], rowCount: number): void {
+  /**
+   * Re-apply column metadata (labels, decimals, value labels) after a Variable
+   * View edit. Column defs can be swapped at runtime, so no grid rebuild needed.
+   */
+  refresh(): void {
     if (!this.api) return;
+    const { variables } = dataStore.get();
+    this.api.updateGridOptions({ columnDefs: this.buildColumnDefs(variables) });
+    this.api.refreshCells({ force: true });
+  }
 
-    const colDefs: ColDef[] = [
+  // ── Grid lifecycle ─────────────────────────────────────────────────────────
+
+  /** Destroy and recreate the grid — the only way to change cacheBlockSize. */
+  private rebuild(blockSize: number, columnDefs: ColDef[], datasource: IDatasource | undefined): void {
+    this.api?.destroy();
+    this.api = createGrid(this.container, this.gridOptions(blockSize, columnDefs, datasource));
+  }
+
+  // ── Builders ───────────────────────────────────────────────────────────────
+
+  /** Cap each fetched page near ~50k cells so wide frames don't pull huge blocks. */
+  private blockSizeFor(colCount: number): number {
+    const cols = Math.max(1, colCount);
+    return Math.min(200, Math.max(10, Math.floor(50_000 / cols)));
+  }
+
+  private buildColumnDefs(variables: Variable[]): ColDef[] {
+    return [
       {
         headerName: '#',
-        valueGetter: (p) => p.node?.rowIndex != null ? p.node.rowIndex + 1 : '',
+        valueGetter: (p) => (p.node?.rowIndex != null ? p.node.rowIndex + 1 : ''),
         width: 56,
         minWidth: 40,
         pinned: 'left',
@@ -98,13 +143,11 @@ export class DataView {
         width: Math.max(100, v.width * 10),
         valueFormatter: (params) => {
           if (params.value == null) return '';
-          // Show value labels if configured
           const label = v.valueLabels[String(params.value)];
           if (label) return label;
           if (v.type === 'numeric' && v.decimals >= 0) {
             const num = Number(params.value);
-            if (isNaN(num)) return params.value;
-            // If it's an integer and not "clearly a float", don't show decimals
+            if (isNaN(num)) return String(params.value);
             if (num % 1 === 0) return num.toFixed(0);
             return num.toFixed(v.decimals);
           }
@@ -112,8 +155,10 @@ export class DataView {
         },
       })),
     ];
+  }
 
-    const datasource: IDatasource = {
+  private buildDatasource(rowCount: number): IDatasource {
+    return {
       rowCount,
       getRows: (params: IGetRowsParams) => {
         const offset = params.startRow;
@@ -129,26 +174,6 @@ export class DataView {
           });
       },
     };
-
-    // Keep each fetched page to a sane number of cells regardless of width.
-    // ~50k cells/page: 4484 cols → 11 rows, 50 cols → 1000 (capped at 200).
-    const cols = Math.max(1, variables.length);
-    const blockSize = Math.min(200, Math.max(10, Math.floor(50_000 / cols)));
-
-    this.api.updateGridOptions({
-      cacheBlockSize: blockSize,
-      columnDefs: colDefs,
-      datasource: datasource,
-    });
-
-    // Explicitly refresh the cache to ensure the new datasource is used immediately
-    this.api.refreshInfiniteCache();
-  }
-
-  /** Called externally after variables are refreshed from VariableView edits. */
-  refresh(): void {
-    const { variables, rowCount } = dataStore.get();
-    this.applyDataset(variables, rowCount);
   }
 
   destroy(): void {
