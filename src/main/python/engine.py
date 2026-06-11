@@ -33,6 +33,7 @@ _df: pl.DataFrame | None = None
 _var_meta: dict[str, dict] = {}
 _current_path: str | None = None
 _cached_variables: list[dict] | None = None
+_float_cols: list[str] = []   # cached at load so get_page skips a schema scan
 
 # Protects mutable state (_df, _var_meta) during write operations.
 # Read-only ops (get_page, get_variables) need no lock — Polars slices are safe.
@@ -148,23 +149,24 @@ def _variables_payload() -> list[dict]:
 
 
 def _sanitise_floats(frame: pl.DataFrame) -> pl.DataFrame:
-    """Replace NaN/Inf with null so Polars write_json produces valid JSON."""
-    float_cols = [c for c in frame.columns if frame.schema[c] in (pl.Float32, pl.Float64)]
-    if not float_cols:
+    """Replace NaN/Inf with null so Polars write_json produces valid JSON.
+    Uses the float-column list cached at load time instead of rescanning the
+    schema on every page (matters when there are thousands of columns)."""
+    if not _float_cols:
         return frame
     return frame.with_columns([
         pl.when(pl.col(c).is_nan() | pl.col(c).is_infinite())
         .then(None)
         .otherwise(pl.col(c))
         .alias(c)
-        for c in float_cols
+        for c in _float_cols
     ])
 
 
 # ── Command handlers ──────────────────────────────────────────────────────────
 
 def cmd_load_file(args: dict) -> dict:
-    global _df, _var_meta, _current_path, _cached_variables
+    global _df, _var_meta, _current_path, _cached_variables, _float_cols
     file_path: str = args["path"]
     ext = Path(file_path).suffix.lower()
     _log(f"Loading: {file_path}")
@@ -215,6 +217,7 @@ def cmd_load_file(args: dict) -> dict:
             return {"error": "Failed to load dataset"}
 
         _current_path = file_path
+        _float_cols = [c for c, dt in _df.schema.items() if dt in (pl.Float32, pl.Float64)]
         _log(f"Loaded {len(_df)} rows × {len(_df.columns)} cols")
 
         return {
@@ -313,12 +316,13 @@ def cmd_save_file(args: dict) -> dict:
 
 
 def cmd_new_dataset(_args: dict) -> dict:
-    global _df, _var_meta, _current_path, _cached_variables
+    global _df, _var_meta, _current_path, _cached_variables, _float_cols
     with _data_lock:
         _df = pl.DataFrame()
         _var_meta = {}
         _current_path = None
         _cached_variables = None
+        _float_cols = []
     return {"ok": True, "rowCount": 0, "colCount": 0, "variables": []}
 
 

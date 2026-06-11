@@ -61,8 +61,9 @@ export class PythonBridge {
       this.reader.push(chunk, (raw) => this.handleMessage(raw as Record<string, unknown>));
     });
 
+    // engine.py already prefixes its stderr lines with "[Python]"; don't double it
     this.proc.stderr?.on('data', (chunk: Buffer) =>
-      console.error('[Python]', chunk.toString().trim()),
+      console.error(chunk.toString().trimEnd()),
     );
 
     this.proc.on('exit', (code) => {

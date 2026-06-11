@@ -27,9 +27,15 @@ export class DataView {
     this.api = createGrid(this.container, {
       theme: themeBalham.withParams({ accentColor: '#6366f1' }),
       rowModelType: 'infinite',
-      cacheBlockSize: 500,
-      maxBlocksInCache: 8,
+      // Block size is tuned per-dataset in applyDataset(): wide frames (1000s of
+      // columns) must use small blocks or the first page would be millions of
+      // cells / tens of MB. 100 is a safe default until a dataset is loaded.
+      cacheBlockSize: 100,
+      maxBlocksInCache: 10,
       infiniteInitialRowCount: 100,
+      // Treat `field` as a literal key. Without this, column names containing a
+      // dot (e.g. "Q1.A") are read as nested paths row["Q1"]["A"] → blank cells.
+      suppressFieldDotNotation: true,
       columnDefs: [],
       defaultColDef: {
         resizable: true,
@@ -124,11 +130,17 @@ export class DataView {
       },
     };
 
+    // Keep each fetched page to a sane number of cells regardless of width.
+    // ~50k cells/page: 4484 cols → 11 rows, 50 cols → 1000 (capped at 200).
+    const cols = Math.max(1, variables.length);
+    const blockSize = Math.min(200, Math.max(10, Math.floor(50_000 / cols)));
+
     this.api.updateGridOptions({
+      cacheBlockSize: blockSize,
       columnDefs: colDefs,
       datasource: datasource,
     });
-    
+
     // Explicitly refresh the cache to ensure the new datasource is used immediately
     this.api.refreshInfiniteCache();
   }
