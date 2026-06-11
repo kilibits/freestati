@@ -2,89 +2,25 @@
   "name": "freestati",
   "version": "1.0.0",
   "description": "FreeStati — free, cross-platform statistical analysis",
-  "main": "dist/main/main.js",
   "scripts": {
-    "start": "npm run build && electron .",
-    "dev": "npm run build && concurrently \"npm run watch:main\" \"node scripts/build-renderer.mjs --watch\" \"wait-on dist/main/main.js dist/renderer/renderer.js && electron . --inspect\"",
-    "build": "npm run build:main && npm run build:renderer",
-    "build:main": "tsc -p tsconfig.main.json",
+    "dev": "tauri dev",
+    "start": "tauri dev",
+    "build": "npm run build:renderer",
     "build:renderer": "node scripts/build-renderer.mjs",
-    "watch:main": "tsc -p tsconfig.main.json --watch",
-    "package": "npm run build && electron-builder --publish never",
-    "package:win": "npm run build && electron-builder --win --publish never",
-    "package:mac": "npm run build && electron-builder --mac --publish never",
-    "package:linux": "npm run build && electron-builder --linux --publish never",
-    "lint": "tsc --noEmit -p tsconfig.main.json && tsc --noEmit -p tsconfig.renderer.json"
+    "watch:renderer": "node scripts/build-renderer.mjs --watch",
+    "package": "tauri build",
+    "tauri": "tauri",
+    "lint": "tsc --noEmit -p tsconfig.renderer.json"
   },
   "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0",
     "@types/node": "^20.14.0",
     "ag-grid-community": "^33.0.0",
-    "concurrently": "^8.2.2",
-    "copyfiles": "^2.4.1",
     "esbuild": "^0.23.0",
-    "electron": "^31.0.0",
-    "electron-builder": "^24.13.3",
-    "typescript": "^5.5.2",
-    "wait-on": "^7.2.0"
+    "typescript": "^5.5.2"
   },
   "dependencies": {
-    "@msgpack/msgpack": "^3.0.0",
-    "electron-updater": "^6.2.1"
-  },
-  "build": {
-    "appId": "com.freestati.app",
-    "productName": "FreeStati",
-    "copyright": "Copyright © 2026",
-    "directories": {
-      "output": "release",
-      "buildResources": "assets"
-    },
-    "files": [
-      "dist/**/*",
-      "!dist/**/*.map"
-    ],
-    "extraResources": [
-      { "from": "src/main/python", "to": "python" }
-    ],
-    "win": {
-      "target": [
-        { "target": "nsis", "arch": ["x64", "arm64"] },
-        { "target": "portable", "arch": ["x64"] }
-      ],
-      "icon": "assets/icon.ico",
-      "artifactName": "${productName}-${version}-${arch}.${ext}"
-    },
-    "nsis": {
-      "oneClick": false,
-      "allowToChangeInstallationDirectory": true,
-      "createDesktopShortcut": true,
-      "createStartMenuShortcut": true
-    },
-    "mac": {
-      "target": [
-        { "target": "dmg", "arch": ["x64", "arm64"] },
-        { "target": "zip", "arch": ["x64", "arm64"] }
-      ],
-      "icon": "assets/icon.icns",
-      "category": "public.app-category.utilities",
-      "hardenedRuntime": true,
-      "gatekeeperAssess": false,
-      "artifactName": "${productName}-${version}-${arch}.${ext}"
-    },
-    "dmg": { "sign": false },
-    "linux": {
-      "target": [
-        { "target": "AppImage", "arch": ["x64", "arm64"] },
-        { "target": "deb", "arch": ["x64"] },
-        { "target": "rpm", "arch": ["x64"] }
-      ],
-      "icon": "assets/icons",
-      "category": "Utility",
-      "artifactName": "${productName}-${version}-${arch}.${ext}"
-    },
-    "publish": {
-      "provider": "github",
-      "releaseType": "release"
-    }
+    "@tauri-apps/api": "^2.0.0",
+    "@tauri-apps/plugin-dialog": "^2.0.0"
   }
 }

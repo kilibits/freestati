@@ -1,3 +1,6 @@
+// Import for side effect: installs window.electron backed by Tauri.
+// Must run before any component touches window.electron.
+import './bridge';
 import { App } from './components/App';
 
 document.addEventListener('DOMContentLoaded', () => {

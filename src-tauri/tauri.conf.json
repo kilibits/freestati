@@ -1,0 +1,35 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "FreeStati",
+  "version": "1.0.0",
+  "identifier": "com.freestati.app",
+  "build": {
+    "beforeDevCommand": "npm run build:renderer",
+    "beforeBuildCommand": "npm run build:renderer",
+    "frontendDist": "../dist/renderer"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "title": "FreeStati",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 550,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": ["icons/icon.png"],
+    "category": "Utility",
+    "copyright": "Copyright © 2026"
+  }
+}

@@ -13,8 +13,6 @@ src/**/*.d.ts
 # ...but global.d.ts is hand-written source, not a compiled artifact
 !src/renderer/global.d.ts
 
-# Python
-__pycache__/
-*.pyc
-.venv/
-venv/
+# Tauri / Rust build output
+src-tauri/target/
+src-tauri/gen/
