@@ -16,7 +16,7 @@
 //! p-values come from special functions (regularized incomplete beta/gamma, erf)
 //! implemented here rather than a heavy stats dependency, keeping the binary small.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use polars::prelude::*;
 use serde::Serialize;
@@ -628,12 +628,13 @@ impl Engine {
             "glm_multivariate" => self.glm_multivariate(
                 df,
                 &p_strs(params, "dependents")?,
-                &p_str(params, "factor")?,
+                &p_strs_opt(params, "factors"),
+                &p_strs_opt(params, "covariates"),
             ),
             "mixed_model" => self.mixed_model(
                 df,
                 &p_str(params, "dependent")?,
-                &p_str(params, "subject")?,
+                &p_strs(params, "randomFactors")?,
                 &p_strs_opt(params, "covariates"),
             ),
             "survival_km" => self.survival_km(
@@ -646,6 +647,7 @@ impl Engine {
             "cox_regression" => self.cox_regression(
                 df,
                 &p_str(params, "time")?,
+                p_str_opt(params, "startTime").as_deref(),
                 &p_str(params, "status")?,
                 &p_str_opt(params, "eventValue").unwrap_or_else(|| "1".into()),
                 &p_strs(params, "covariates")?,
@@ -2262,73 +2264,176 @@ impl Engine {
         &self,
         df: &DataFrame,
         dependents: &[String],
-        factor: &str,
+        factors: &[String],
+        covariates: &[String],
     ) -> SResult<Analysis> {
         let p = dependents.len();
         if p < 2 {
             return Err("MANOVA needs at least 2 dependent variables".into());
         }
-        let cols: Vec<Vec<Option<f64>>> =
+        if factors.is_empty() && covariates.is_empty() {
+            return Err("Specify at least one factor or covariate".into());
+        }
+
+        // Listwise deletion across all variables.
+        let y_cols: Vec<Vec<Option<f64>>> =
             dependents.iter().map(|v| col_opt(df, v)).collect::<SResult<_>>()?;
-        let labels = col_labels(df, factor)?;
+        let fac_all: Vec<Vec<Option<String>>> =
+            factors.iter().map(|f| col_labels(df, f)).collect::<SResult<_>>()?;
+        let cov_all: Vec<Vec<Option<f64>>> =
+            covariates.iter().map(|c| col_opt(df, c)).collect::<SResult<_>>()?;
         let nrows = df.height();
 
-        // Listwise-deleted rows grouped by factor level.
-        let mut groups: BTreeMap<String, Vec<Vec<f64>>> = BTreeMap::new();
-        let mut all: Vec<Vec<f64>> = Vec::new();
+        let mut keep = Vec::new();
         for i in 0..nrows {
-            if labels[i].is_none() || cols.iter().any(|c| c[i].is_none()) {
-                continue;
+            let ok = y_cols.iter().all(|c| c[i].is_some())
+                && fac_all.iter().all(|f| f[i].is_some())
+                && cov_all.iter().all(|c| c[i].is_some());
+            if ok {
+                keep.push(i);
             }
-            let row: Vec<f64> = cols.iter().map(|c| c[i].unwrap()).collect();
-            all.push(row.clone());
-            groups.entry(labels[i].clone().unwrap()).or_default().push(row);
         }
-        let k = groups.len();
-        let total_n = all.len();
-        if k < 2 {
-            return Err(format!("'{factor}' must have at least 2 groups"));
-        }
-        if total_n <= p + k {
-            return Err("Not enough complete cases for MANOVA".into());
+        let n = keep.len();
+        if n < p + 5 {
+            return Err("Not enough complete cases".into());
         }
 
-        let grand: Vec<f64> = (0..p)
-            .map(|j| all.iter().map(|r| r[j]).sum::<f64>() / total_n as f64)
+        let y_data: Vec<Vec<f64>> = dependents
+            .iter()
+            .enumerate()
+            .map(|(ji, _)| keep.iter().map(|&i| y_cols[ji][i].unwrap()).collect())
             .collect();
 
-        // Error (within) and Hypothesis (between) SSCP matrices.
-        let mut e = vec![vec![0.0; p]; p];
-        let mut h = vec![vec![0.0; p]; p];
-        for g in groups.values() {
-            let ng = g.len() as f64;
-            let gmean: Vec<f64> = (0..p).map(|j| g.iter().map(|r| r[j]).sum::<f64>() / ng).collect();
-            for r in g {
-                for a in 0..p {
-                    for b in 0..p {
-                        e[a][b] += (r[a] - gmean[a]) * (r[b] - gmean[b]);
+        // Design matrix (Reference coding).
+        let mut effects: Vec<Effect> = Vec::new();
+        for (ci, cov) in covariates.iter().enumerate() {
+            let col: Vec<f64> = keep.iter().map(|&i| cov_all[ci][i].unwrap()).collect();
+            effects.push(Effect { name: self.display(cov), cols: vec![col] });
+        }
+
+        let levels: Vec<Vec<String>> = factors
+            .iter()
+            .enumerate()
+            .map(|(fi, _)| {
+                let mut lv: Vec<String> =
+                    keep.iter().map(|&i| fac_all[fi][i].clone().unwrap()).collect();
+                lv.sort();
+                lv.dedup();
+                lv
+            })
+            .collect();
+
+        let dummies: Vec<Vec<Vec<f64>>> = factors
+            .iter()
+            .enumerate()
+            .map(|(fi, _)| {
+                levels[fi]
+                    .iter()
+                    .skip(1)
+                    .map(|lev| {
+                        keep.iter()
+                            .map(|&i| if fac_all[fi][i].as_deref() == Some(lev) { 1.0 } else { 0.0 })
+                            .collect::<Vec<f64>>()
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let nf = factors.len();
+        for mask in 1u32..(1u32 << nf) {
+            let involved: Vec<usize> = (0..nf).filter(|&b| mask & (1 << b) != 0).collect();
+            let name = involved.iter().map(|&b| self.display(&factors[b])).collect::<Vec<_>>().join(" * ");
+            let mut cols: Vec<Vec<f64>> = vec![vec![1.0; n]];
+            for &b in &involved {
+                let mut next = Vec::new();
+                for existing in &cols {
+                    for dcol in &dummies[b] {
+                        next.push((0..n).map(|i| existing[i] * dcol[i]).collect());
                     }
                 }
+                cols = next;
             }
-            for a in 0..p {
-                for b in 0..p {
-                    h[a][b] += ng * (gmean[a] - grand[a]) * (gmean[b] - grand[b]);
+            effects.push(Effect { name, cols });
+        }
+
+        let intercept = vec![1.0; n];
+        let full_design: Vec<&Vec<f64>> = std::iter::once(&intercept)
+            .chain(effects.iter().flat_map(|e| e.cols.iter()))
+            .collect();
+
+        let k_cols = full_design.len();
+        let df_h = (k_cols - 1) as f64;
+        let df_e = (n - k_cols) as f64;
+        if df_e <= 0.0 {
+            return Err("Too many parameters for the number of cases".into());
+        }
+
+        // Parameter estimates (contrasts) for each DV.
+        let mut est_table = OutTable::new(
+            "Parameter Estimates",
+            vec!["Dependent Variable", "Parameter", "B", "Std. Error", "t", "Sig."],
+        );
+        let mut xtx = vec![vec![0.0; k_cols]; k_cols];
+        for a in 0..k_cols {
+            for b in 0..k_cols {
+                xtx[a][b] = (0..n).map(|i| full_design[a][i] * full_design[b][i]).sum();
+            }
+        }
+        let xtx_inv = invert(xtx).ok_or("Design matrix is singular")?;
+
+        let mut e_mat = vec![vec![0.0; p]; p];
+        let mut h_mat = vec![vec![0.0; p]; p];
+
+        for (ji, dep_name) in dependents.iter().enumerate() {
+            let y = &y_data[ji];
+            let xty: Vec<f64> = (0..k_cols).map(|a| (0..n).map(|i| full_design[a][i] * y[i]).sum()).collect();
+            let beta: Vec<f64> = (0..k_cols).map(|a| (0..k_cols).map(|b| xtx_inv[a][b] * xty[b]).sum()).collect();
+            let yhat: Vec<f64> = (0..n).map(|i| (0..k_cols).map(|a| beta[a] * full_design[a][i]).sum()).collect();
+            let resid: Vec<f64> = (0..n).map(|i| y[i] - yhat[i]).collect();
+            let sse: f64 = resid.iter().map(|r| r * r).sum();
+            let mse = sse / df_e;
+
+            // SSCP accumulation for multivariate tests.
+            for j2 in 0..p {
+                let y2 = &y_data[j2];
+                let xty2: Vec<f64> = (0..k_cols).map(|a| (0..n).map(|i| full_design[a][i] * y2[i]).sum()).collect();
+                let beta2: Vec<f64> = (0..k_cols).map(|a| (0..k_cols).map(|b| xtx_inv[a][b] * xty2[b]).sum()).collect();
+                let yhat2: Vec<f64> = (0..n).map(|i| (0..k_cols).map(|a| beta2[a] * full_design[a][i]).sum()).collect();
+                
+                let grand2 = y2.iter().sum::<f64>() / n as f64;
+                h_mat[ji][j2] = (0..n).map(|i| (yhat[i] - (y.iter().sum::<f64>() / n as f64)) * (yhat2[i] - grand2)).sum();
+                e_mat[ji][j2] = (0..n).map(|i| (y[i] - yhat[i]) * (y2[i] - yhat2[i])).sum();
+            }
+
+            // Row for intercept.
+            let se_int = (mse * xtx_inv[0][0]).sqrt();
+            let t_int = beta[0] / se_int;
+            est_table.rows.push(vec![text(self.display(dep_name)), text("(Intercept)"), num(beta[0]), num(se_int), num(t_int), num(t_sig_2tailed(t_int, df_e))]);
+
+            let mut cur_col = 1;
+            for e in &effects {
+                for (cci, _) in e.cols.iter().enumerate() {
+                    let b_val = beta[cur_col];
+                    let se = (mse * xtx_inv[cur_col][cur_col]).sqrt();
+                    let t_val = b_val / se;
+                    est_table.rows.push(vec![
+                        text(self.display(dep_name)),
+                        text(format!("{} [{}]", e.name, cci + 1)),
+                        num(b_val),
+                        num(se),
+                        num(t_val),
+                        num(t_sig_2tailed(t_val, df_e)),
+                    ]);
+                    cur_col += 1;
                 }
             }
         }
 
-        let df_h = (k - 1) as f64;
-        let df_e = (total_n - k) as f64;
-
-        // Eigenvalues of E⁻¹H via the symmetric form E^(−1/2) H E^(−1/2).
-        let inv_sqrt = sym_inv_sqrt(&e).ok_or("Error matrix is singular")?;
-        let s_mat = mat_mul(&mat_mul(&inv_sqrt, &h), &inv_sqrt);
+        // Multivariate Tests.
+        let inv_sqrt = sym_inv_sqrt(&e_mat).ok_or("Error matrix is singular")?;
+        let s_mat = mat_mul(&mat_mul(&inv_sqrt, &h_mat), &inv_sqrt);
         let (mut eig, _) = jacobi_eigen(&s_mat);
-        eig.iter_mut().for_each(|l| {
-            if *l < 0.0 {
-                *l = 0.0;
-            }
-        });
+        eig.iter_mut().for_each(|l| { if *l < 0.0 { *l = 0.0; } });
         eig.sort_by(|a, b| b.partial_cmp(a).unwrap());
 
         let s = (p as f64).min(df_h);
@@ -2338,30 +2443,23 @@ impl Engine {
         let roy = eig[0];
 
         let mut mv = OutTable::new(
-            format!("Multivariate Tests — {factor}"),
+            "Multivariate Tests",
             vec!["Effect", "Value", "F", "Hypothesis df", "Error df", "Sig."],
         );
-        // F approximations (Rao / Pillai / Lawley-Hotelling / Roy upper bound).
         let pf = p as f64;
         let m = (pf - df_h).abs() / 2.0 - 0.5;
         let nn = (df_e - pf - 1.0) / 2.0;
 
-        // Pillai.
         if s > 0.0 {
             let df1 = s * (2.0 * m + s + 1.0);
             let df2 = s * (2.0 * nn + s + 1.0);
             let f = ((2.0 * nn + s + 1.0) / (2.0 * m + s + 1.0)) * (pillai / (s - pillai));
             mv.rows.push(row_mv("Pillai's Trace", pillai, f, df1, df2));
         }
-        // Wilks' Lambda (Rao's F).
         {
             let r = df_e - (pf - df_h + 1.0) / 2.0;
             let denom = pf * pf + df_h * df_h - 5.0;
-            let t = if denom > 0.0 {
-                ((pf * pf * df_h * df_h - 4.0) / denom).sqrt()
-            } else {
-                1.0
-            };
+            let t = if denom > 0.0 { ((pf * pf * df_h * df_h - 4.0) / denom).sqrt() } else { 1.0 };
             let u = (pf * df_h - 2.0) / 4.0;
             let df1 = pf * df_h;
             let df2 = r * t - 2.0 * u;
@@ -2369,14 +2467,12 @@ impl Engine {
             let f = ((1.0 - lam_t) / lam_t) * (df2 / df1);
             mv.rows.push(row_mv("Wilks' Lambda", wilks, f, df1, df2));
         }
-        // Hotelling-Lawley Trace.
         if s > 0.0 {
             let df1 = s * (2.0 * m + s + 1.0);
             let df2 = 2.0 * (s * nn + 1.0);
             let f = (df2 * hotelling) / (s * s * (2.0 * m + s + 1.0));
             mv.rows.push(row_mv("Hotelling's Trace", hotelling, f, df1, df2));
         }
-        // Roy's Largest Root (upper-bound F).
         {
             let d = pf.max(df_h);
             let df1 = d;
@@ -2385,35 +2481,15 @@ impl Engine {
             mv.rows.push(row_mv("Roy's Largest Root", roy, f, df1, df2));
         }
 
-        // Per-DV univariate ANOVAs (between-subjects).
-        let mut uni = OutTable::new(
-            "Tests of Between-Subjects Effects",
-            vec!["Dependent Variable", "F", "df1", "df2", "Sig.", "Partial Eta Squared"],
-        );
-        for (j, dep) in dependents.iter().enumerate() {
-            let ss_b = h[j][j];
-            let ss_w = e[j][j];
-            let f = (ss_b / df_h) / (ss_w / df_e);
-            let partial = ss_b / (ss_b + ss_w);
-            uni.rows.push(vec![
-                text(self.display(dep)),
-                num(f),
-                num(df_h),
-                num(df_e),
-                num(f_sig(f, df_h, df_e)),
-                num(partial),
-            ]);
-        }
-
         Ok(Analysis {
-            title: "GLM Multivariate (MANOVA)".into(),
-            tables: vec![mv, uni],
+            title: "GLM Multivariate (MANCOVA)".into(),
+            tables: vec![mv, est_table],
         })
     }
 
     // ── Linear Mixed Model (random intercept) ─────────────────────────────────
 
-    fn mixed_model(
+    fn mixed_model_single(
         &self,
         df: &DataFrame,
         dependent: &str,
@@ -2447,8 +2523,7 @@ impl Engine {
             return Err("Not enough complete cases".into());
         }
 
-        // Group by subject; precompute per-group sufficient statistics that are
-        // independent of the variance ratio γ = σ²_u / σ²_e.
+        // Group by subject; precompute per-group sufficient statistics.
         let mut order: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         for i in 0..n {
             order.entry(subj[i].clone()).or_default().push(i);
@@ -2458,11 +2533,11 @@ impl Engine {
         }
         struct GStat {
             ni: f64,
-            xtx: Vec<Vec<f64>>, // X_i' X_i
-            xty: Vec<f64>,      // X_i' y_i
-            s: Vec<f64>,        // X_i' 1
-            sy: f64,            // 1' y_i
-            yty: f64,           // y_i' y_i
+            xtx: Vec<Vec<f64>>,
+            xty: Vec<f64>,
+            s: Vec<f64>,
+            sy: f64,
+            yty: f64,
         }
         let mut gstats: Vec<GStat> = Vec::new();
         for idxs in order.values() {
@@ -2485,7 +2560,6 @@ impl Engine {
             gstats.push(GStat { ni: idxs.len() as f64, xtx, xty, s, sy, yty });
         }
 
-        // GLS solve at a given γ; returns (β̂, A⁻¹, rss, ln|A|, Σ ln|V*_i|).
         let np = (n - p) as f64;
         let solve = |gamma: f64| -> Option<(Vec<f64>, Vec<Vec<f64>>, f64, f64, f64)> {
             let mut a = vec![vec![0.0; p]; p];
@@ -2493,7 +2567,7 @@ impl Engine {
             let mut ytvy = 0.0;
             let mut logdet_v = 0.0;
             for g in &gstats {
-                let c = gamma / (1.0 + g.ni * gamma); // V*_i⁻¹ = I − c·J
+                let c = gamma / (1.0 + g.ni * gamma);
                 logdet_v += (1.0 + g.ni * gamma).ln();
                 ytvy += g.yty - c * g.sy * g.sy;
                 for a_i in 0..p {
@@ -2510,7 +2584,6 @@ impl Engine {
             Some((beta, ainv, rss, ld_a, logdet_v))
         };
 
-        // −2 REML deviance to minimise over γ (profiled over σ²_e).
         let deviance = |gamma: f64| -> f64 {
             match solve(gamma) {
                 Some((_, _, rss, ld_a, ld_v)) if rss > 0.0 => np * (rss / np).ln() + ld_v + ld_a,
@@ -2518,14 +2591,13 @@ impl Engine {
             }
         };
 
-        // Golden-section search over θ where γ = exp(θ); compare with γ = 0.
         let gr = (5.0_f64.sqrt() - 1.0) / 2.0;
         let (mut lo, mut hi) = (-15.0_f64, 8.0_f64);
         let mut c1 = hi - gr * (hi - lo);
         let mut c2 = lo + gr * (hi - lo);
         let mut f1 = deviance(c1.exp());
         let mut f2 = deviance(c2.exp());
-        for _ in 0..120 {
+        for _ in 0..100 {
             if f1 < f2 {
                 hi = c2;
                 c2 = c1;
@@ -2541,30 +2613,23 @@ impl Engine {
             }
         }
         let gamma_opt = (0.5 * (lo + hi)).exp();
-        // No random effect (γ = 0) can be the REML optimum on the boundary.
         let gamma = if deviance(0.0) <= deviance(gamma_opt) { 0.0 } else { gamma_opt };
 
         let (beta, ainv, rss, ld_a, ld_v) =
             solve(gamma).ok_or("REML solve failed (collinear design)")?;
         let var_resid = rss / np;
         let var_subject = gamma * var_resid;
-        let icc = var_subject / (var_subject + var_resid);
         let neg2ll = np * (rss / np).ln() + ld_v + ld_a + np * (1.0 + (2.0 * std::f64::consts::PI).ln());
 
-        // Fixed effects (Wald z tests; LMM denominator df is approximate).
         let mut fixed = OutTable::new(
             "Fixed Effects Estimates",
             vec!["", "Estimate", "Std. Error", "z", "Sig.", "95% CI Lower", "95% CI Upper"],
         )
-        .footnote("REML estimation; significance from Wald z (large-sample) tests.");
+        .footnote("REML estimation; significance from Wald z tests.");
         for a in 0..p {
             let se = (var_resid * ainv[a][a]).sqrt();
             let z = beta[a] / se;
-            let label = if a == 0 {
-                "(Intercept)".to_string()
-            } else {
-                self.display(&covariates[a - 1])
-            };
+            let label = if a == 0 { "(Intercept)".to_string() } else { self.display(&covariates[a - 1]) };
             fixed.rows.push(vec![
                 text(label),
                 num(beta[a]),
@@ -2578,7 +2643,7 @@ impl Engine {
 
         let mut vc = OutTable::new(
             "Covariance Parameters (REML)",
-            vec!["", "Variance", "Std. Deviation"],
+            vec!["Component", "Variance", "Std. Deviation"],
         );
         vc.rows.push(vec![
             text(format!("{} (intercept)", self.display(subject))),
@@ -2587,12 +2652,213 @@ impl Engine {
         ]);
         vc.rows.push(vec![text("Residual"), num(var_resid), num(var_resid.sqrt())]);
 
-        let mut info = OutTable::new("Model & Intraclass Correlation", vec!["", "Value"]);
-        info.rows.push(vec![text("ICC"), num(icc)]);
+        let mut info = OutTable::new("Model Information", vec!["Metric", "Value"]);
+        info.rows.push(vec![text("ICC"), num(var_subject / (var_subject + var_resid))]);
         info.rows.push(vec![text("−2 Restricted Log Likelihood"), num(neg2ll)]);
 
         Ok(Analysis {
-            title: "Linear Mixed Model (random intercept, REML)".into(),
+            title: "Linear Mixed Model (REML)".into(),
+            tables: vec![fixed, vc, info],
+        })
+    }
+
+    fn mixed_model(
+        &self,
+        df: &DataFrame,
+        dependent: &str,
+        random_factors: &[String],
+        covariates: &[String],
+    ) -> SResult<Analysis> {
+        let y_all = col_opt(df, dependent)?;
+        let rf_all: Vec<Vec<Option<String>>> =
+            random_factors.iter().map(|f| col_labels(df, f)).collect::<SResult<_>>()?;
+        let cov_all: Vec<Vec<Option<f64>>> =
+            covariates.iter().map(|c| col_opt(df, c)).collect::<SResult<_>>()?;
+        let nrows = df.height();
+
+        let mut y = Vec::new();
+        let mut rf = vec![Vec::new(); random_factors.len()];
+        let mut x: Vec<Vec<f64>> = Vec::new();
+        for i in 0..nrows {
+            if y_all[i].is_none()
+                || rf_all.iter().any(|f| f[i].is_none())
+                || cov_all.iter().any(|c| c[i].is_none())
+            {
+                continue;
+            }
+            y.push(y_all[i].unwrap());
+            for j in 0..random_factors.len() {
+                rf[j].push(rf_all[j][i].clone().unwrap());
+            }
+            let mut row = vec![1.0];
+            for c in &cov_all {
+                row.push(c[i].unwrap());
+            }
+            x.push(row);
+        }
+        let n = y.len();
+        let p = 1 + covariates.len();
+        let q = random_factors.len();
+        if n <= p + q {
+            return Err("Not enough complete cases".into());
+        }
+
+        if q == 1 {
+            return self.mixed_model_single(df, dependent, &random_factors[0], covariates);
+        }
+
+        // Build Z matrices (one for each random factor).
+        let mut z: Vec<Vec<Vec<f64>>> = Vec::new();
+        let mut n_levels = Vec::new();
+        for j in 0..q {
+            let unique: BTreeSet<String> = rf[j].iter().cloned().collect();
+            let levels: Vec<String> = unique.into_iter().collect();
+            let n_l = levels.len();
+            n_levels.push(n_l);
+            let mut zj = vec![vec![0.0; n_l]; n];
+            for i in 0..n {
+                let l_idx = levels.iter().position(|l| l == &rf[j][i]).unwrap();
+                zj[i][l_idx] = 1.0;
+            }
+            z.push(zj);
+        }
+
+        // GLS solve at given variance ratios gamma_j = sigma^2_j / sigma^2_e.
+        // V = I + sum(gamma_j * Zj * Zj').
+        let solve = |gammas: &[f64]| -> Option<(Vec<f64>, Vec<Vec<f64>>, f64, f64, f64)> {
+            let mut v = vec![vec![0.0; n]; n];
+            for i in 0..n {
+                v[i][i] = 1.0 + 1e-9;
+                for j in 0..q {
+                    for l in 0..n_levels[j] {
+                        if z[j][i][l] > 0.0 {
+                            for i2 in 0..n {
+                                if z[j][i2][l] > 0.0 {
+                                    v[i][i2] += gammas[j];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let vinv = invert(v.clone())?;
+            let logdet_v = log_det(v)?;
+
+            // X' V^-1 X
+            let mut xtvx = vec![vec![0.0; p]; p];
+            let mut xtvy = vec![0.0; p];
+            for a in 0..p {
+                let mut v_inv_xa = vec![0.0; n];
+                for i in 0..n {
+                    for k in 0..n {
+                        v_inv_xa[i] += vinv[i][k] * x[k][a];
+                    }
+                }
+                for b in 0..p {
+                    for i in 0..n {
+                        xtvx[a][b] += x[i][b] * v_inv_xa[i];
+                    }
+                }
+                for i in 0..n {
+                    xtvy[a] += v_inv_xa[i] * y[i];
+                }
+            }
+
+            let ainv = invert(xtvx.clone())?;
+            let ld_a = log_det(xtvx)?;
+            let beta: Vec<f64> = (0..p).map(|i| (0..p).map(|j| ainv[i][j] * xtvy[j]).sum()).collect();
+
+            // y' V^-1 y - beta' (X' V^-1 y)
+            let mut ytvy = 0.0;
+            for i in 0..n {
+                let mut v_inv_yi = 0.0;
+                for k in 0..n {
+                    v_inv_yi += vinv[i][k] * y[k];
+                }
+                ytvy += y[i] * v_inv_yi;
+            }
+            let rss = ytvy - (0..p).map(|i| beta[i] * xtvy[i]).sum::<f64>();
+
+            Some((beta, ainv, rss, ld_a, logdet_v))
+        };
+
+        // Minimise -2 REML deviance over gammas.
+        // For q > 1, we use a simple coordinate descent / grid search for now.
+        // Real-world mixed model solvers use derivative-based optimization (AIJ, NR).
+        let mut gammas = vec![0.0; q];
+        let np = (n - p) as f64;
+        let deviance = |gs: &[f64]| -> f64 {
+            match solve(gs) {
+                Some((_, _, rss, ld_a, ld_v)) if rss > 0.0 => np * (rss / np).ln() + ld_v + ld_a,
+                _ => f64::INFINITY,
+            }
+        };
+
+        // Coordinate descent.
+        for _ in 0..5 {
+            for j in 0..q {
+                let mut best_g = gammas[j];
+                let mut best_d = deviance(&gammas);
+                for &test_g in &[0.0, 0.01, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0] {
+                    let old_g = gammas[j];
+                    gammas[j] = test_g;
+                    let d = deviance(&gammas);
+                    if d < best_d {
+                        best_d = d;
+                        best_g = test_g;
+                    } else {
+                        gammas[j] = old_g;
+                    }
+                }
+                gammas[j] = best_g;
+            }
+        }
+
+        let (beta, ainv, rss, ld_a, ld_v) =
+            solve(&gammas).ok_or("REML solve failed (collinear design)")?;
+        let var_resid = rss / np;
+        let neg2ll = np * (rss / np).ln() + ld_v + ld_a + np * (1.0 + (2.0 * std::f64::consts::PI).ln());
+
+        // Fixed effects.
+        let mut fixed = OutTable::new(
+            "Fixed Effects Estimates",
+            vec!["", "Estimate", "Std. Error", "z", "Sig.", "95% CI Lower", "95% CI Upper"],
+        )
+        .footnote("REML estimation; significance from Wald z tests.");
+        for a in 0..p {
+            let se = (var_resid * ainv[a][a]).sqrt();
+            let z = beta[a] / se;
+            let label = if a == 0 { "(Intercept)".to_string() } else { self.display(&covariates[a - 1]) };
+            fixed.rows.push(vec![
+                text(label),
+                num(beta[a]),
+                num(se),
+                num(z),
+                num(z_sig_2tailed(z)),
+                num(beta[a] - 1.959964 * se),
+                num(beta[a] + 1.959964 * se),
+            ]);
+        }
+
+        let mut vc = OutTable::new(
+            "Covariance Parameters (REML)",
+            vec!["Component", "Variance", "Std. Deviation"],
+        );
+        for j in 0..q {
+            let v_j = gammas[j] * var_resid;
+            vc.rows.push(vec![
+                text(format!("{} (intercept)", self.display(&random_factors[j]))),
+                num(v_j),
+                num(v_j.sqrt()),
+            ]);
+        }
+        vc.rows.push(vec![text("Residual"), num(var_resid), num(var_resid.sqrt())]);
+
+        let mut info = OutTable::new("Model Information", vec!["Metric", "Value"]);
+        info.rows.push(vec![text("−2 Restricted Log Likelihood"), num(neg2ll)]);
+
+        Ok(Analysis {
+            title: "Linear Mixed Model (REML)".into(),
             tables: vec![fixed, vc, info],
         })
     }
@@ -2721,6 +2987,7 @@ impl Engine {
         &self,
         df: &DataFrame,
         time: &str,
+        start_time: Option<&str>,
         status: &str,
         event_value: &str,
         covariates: &[String],
@@ -2730,13 +2997,18 @@ impl Engine {
             return Err("Cox regression needs at least one covariate".into());
         }
         let times = col_opt(df, time)?;
+        let starts = match start_time {
+            Some(s) => Some(col_opt(df, s)?),
+            None => None,
+        };
         let stat_labels = col_labels(df, status)?;
         let cov_cols: Vec<Vec<Option<f64>>> =
             covariates.iter().map(|c| col_opt(df, c)).collect::<SResult<_>>()?;
         let nrows = df.height();
 
-        // Listwise deletion; record (time, event, centered covariate vector).
-        let mut t = Vec::new();
+        // Listwise deletion; record (start, stop, event, centered covariate vector).
+        let mut t_start = Vec::new();
+        let mut t_stop = Vec::new();
         let mut ev = Vec::new();
         let mut x: Vec<Vec<f64>> = Vec::new();
         for i in 0..nrows {
@@ -2746,11 +3018,22 @@ impl Engine {
             if cov_cols.iter().any(|c| c[i].is_none()) {
                 continue;
             }
-            t.push(ti);
+            let start = match &starts {
+                Some(s) => match s[i] {
+                    Some(val) => val,
+                    None => continue,
+                },
+                None => 0.0,
+            };
+            if ti <= start {
+                continue; // Invalid interval
+            }
+            t_start.push(start);
+            t_stop.push(ti);
             ev.push(sl == event_value);
             x.push(cov_cols.iter().map(|c| c[i].unwrap()).collect());
         }
-        let n = t.len();
+        let n = t_stop.len();
         let n_events = ev.iter().filter(|&&e| e).count();
         if n_events == 0 {
             return Err("No events (uncensored cases) found".into());
@@ -2759,7 +3042,7 @@ impl Engine {
             return Err("Not enough complete cases".into());
         }
 
-        // Centre covariates (coefficients are invariant; improves conditioning).
+        // Centre covariates.
         let means: Vec<f64> = (0..p)
             .map(|j| x.iter().map(|r| r[j]).sum::<f64>() / n as f64)
             .collect();
@@ -2769,38 +3052,64 @@ impl Engine {
             }
         }
 
-        // Order indices by time ascending for risk-set sweeps.
-        let mut order: Vec<usize> = (0..n).collect();
-        order.sort_by(|&a, &b| t[a].partial_cmp(&t[b]).unwrap_or(std::cmp::Ordering::Equal));
+        // Unique event times for Breslow ties.
+        let mut event_times: Vec<f64> = Vec::new();
+        for i in 0..n {
+            if ev[i] {
+                event_times.push(t_stop[i]);
+            }
+        }
+        event_times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        event_times.dedup_by(|a, b| (*a - *b).abs() < 1e-10);
 
-        // Partial log-likelihood, score, and information at β (Breslow ties).
+        // Partial log-likelihood, score, and information at β.
         let eval = |beta: &[f64]| -> (f64, Vec<f64>, Vec<Vec<f64>>) {
             let mut ll = 0.0;
             let mut score = vec![0.0; p];
             let mut info = vec![vec![0.0; p]; p];
-            // Sweep from longest time to shortest, accumulating the risk set.
-            let mut s0 = 0.0;
-            let mut s1 = vec![0.0; p];
-            let mut s2 = vec![vec![0.0; p]; p];
-            for &i in order.iter().rev() {
-                let eta: f64 = (0..p).map(|j| beta[j] * x[i][j]).sum();
-                let w = eta.exp();
-                s0 += w;
-                for a in 0..p {
-                    s1[a] += w * x[i][a];
-                    for b in 0..p {
-                        s2[a][b] += w * x[i][a] * x[i][b];
+
+            let etas: Vec<f64> = (0..n)
+                .map(|i| (0..p).map(|j| beta[j] * x[i][j]).sum::<f64>())
+                .collect();
+            let exp_etas: Vec<f64> = etas.iter().map(|e| e.exp()).collect();
+
+            for &et in &event_times {
+                let mut s0 = 0.0;
+                let mut s1 = vec![0.0; p];
+                let mut s2 = vec![vec![0.0; p]; p];
+                let mut d_events = 0;
+                let mut d_score = vec![0.0; p];
+                let mut d_eta = 0.0;
+
+                for i in 0..n {
+                    // Risk set: subjects whose interval contains the event time.
+                    if t_start[i] < et && t_stop[i] >= et {
+                        s0 += exp_etas[i];
+                        for a in 0..p {
+                            s1[a] += exp_etas[i] * x[i][a];
+                            for b in 0..p {
+                                s2[a][b] += exp_etas[i] * x[i][a] * x[i][b];
+                            }
+                        }
+                        // Ties at this event time.
+                        if ev[i] && (t_stop[i] - et).abs() < 1e-10 {
+                            d_events += 1;
+                            d_eta += etas[i];
+                            for a in 0..p {
+                                d_score[a] += x[i][a];
+                            }
+                        }
                     }
                 }
-                if ev[i] {
-                    let eta_i: f64 = (0..p).map(|j| beta[j] * x[i][j]).sum();
-                    ll += eta_i - s0.ln();
+
+                if d_events > 0 {
+                    ll += d_eta - (d_events as f64) * s0.ln();
                     for a in 0..p {
                         let ea = s1[a] / s0;
-                        score[a] += x[i][a] - ea;
+                        score[a] += d_score[a] - (d_events as f64) * ea;
                         for b in 0..p {
                             let eb = s1[b] / s0;
-                            info[a][b] += s2[a][b] / s0 - ea * eb;
+                            info[a][b] += (d_events as f64) * (s2[a][b] / s0 - ea * eb);
                         }
                     }
                 }
@@ -4006,7 +4315,7 @@ mod tests {
         let a = eng
             .run_analysis(
                 "glm_multivariate",
-                &serde_json::json!({ "dependents": ["y1", "y2"], "factor": "g" }),
+                &serde_json::json!({ "dependents": ["y1", "y2"], "factors": ["g"] }),
             )
             .unwrap();
         let fs: Vec<f64> = a.tables[0].rows.iter().map(|r| r[2].as_f64().unwrap()).collect();
@@ -4032,7 +4341,7 @@ mod tests {
         let mm = eng
             .run_analysis(
                 "mixed_model",
-                &serde_json::json!({ "dependent": "y", "subject": "subj", "covariates": ["x"] }),
+                &serde_json::json!({ "dependent": "y", "randomFactors": ["subj"], "covariates": ["x"] }),
             )
             .unwrap();
         // ICC value is the last table's single row, column 1.
@@ -4084,7 +4393,7 @@ mod tests {
         let mut eng = Engine::default();
         eng.df = Some(df);
         let a = eng
-            .run_analysis("mixed_model", &serde_json::json!({ "dependent": "y", "subject": "subj", "covariates": [] }))
+            .run_analysis("mixed_model", &serde_json::json!({ "dependent": "y", "randomFactors": ["subj"], "covariates": [] }))
             .unwrap();
         // Covariance parameters: residual variance ≈ 1.0 (each group is m-1,m,m+1).
         let resid = a.tables[1].rows[1][1].as_f64().unwrap();
@@ -4159,5 +4468,62 @@ mod tests {
         close(inv[0][1], -0.7, 1e-9);
         close(inv[1][0], -0.2, 1e-9);
         close(inv[1][1], 0.4, 1e-9);
+    }
+
+    #[test]
+    fn cox_time_varying() {
+        let df = df![
+            "start"  => [0.0, 5.0, 0.0],
+            "stop"   => [5.0, 10.0, 10.0],
+            "status" => [0i64, 1, 1],
+            "x"      => [0.0, 1.0, 0.0],
+        ].unwrap();
+        let mut eng = Engine::default();
+        eng.df = Some(df);
+        let a = eng.run_analysis("cox_regression", &serde_json::json!({
+            "time": "stop",
+            "startTime": "start",
+            "status": "status",
+            "eventValue": "1",
+            "covariates": ["x"]
+        })).unwrap();
+        let b = a.tables[1].rows[0][1].as_f64().unwrap();
+        assert!(b.is_finite());
+    }
+
+    #[test]
+    fn mixed_model_crossed() {
+        let df = df![
+            "y"   => [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            "r1"  => ["a", "a", "b", "b", "a", "a", "b", "b"],
+            "r2"  => ["x", "y", "x", "y", "x", "y", "x", "y"],
+        ].unwrap();
+        let mut eng = Engine::default();
+        eng.df = Some(df);
+        let a = eng.run_analysis("mixed_model", &serde_json::json!({
+            "dependent": "y",
+            "randomFactors": ["r1", "r2"]
+        })).unwrap();
+        assert_eq!(a.tables[1].rows.len(), 3);
+    }
+
+    #[test]
+    fn mancova_full() {
+        // Use random-ish data to avoid singularity.
+        let df = df![
+            "y1" => [1.0, 2.2, 3.1, 4.5, 5.2, 6.7, 7.3, 8.9, 1.4, 2.5, 3.6, 4.1, 5.8, 6.2, 7.7, 8.3],
+            "y2" => [2.1, 3.4, 4.2, 5.6, 6.1, 7.8, 8.2, 9.9, 2.3, 3.1, 4.5, 5.2, 6.7, 7.3, 8.9, 1.4],
+            "f1" => ["a", "a", "a", "a", "b", "b", "b", "b", "a", "a", "a", "a", "b", "b", "b", "b"],
+            "f2" => ["x", "x", "y", "y", "x", "x", "y", "y", "x", "x", "y", "y", "x", "x", "y", "y"],
+            "c1" => [1.1, 2.3, 1.4, 2.5, 1.6, 2.7, 1.8, 2.9, 1.2, 2.4, 1.5, 2.6, 1.7, 2.8, 1.9, 2.1],
+        ].unwrap();
+        let mut eng = Engine::default();
+        eng.df = Some(df);
+        let a = eng.run_analysis("glm_multivariate", &serde_json::json!({
+            "dependents": ["y1", "y2"],
+            "factors": ["f1", "f2"],
+            "covariates": ["c1"]
+        })).unwrap();
+        assert_eq!(a.tables.len(), 2);
     }
 }

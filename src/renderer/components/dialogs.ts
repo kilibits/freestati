@@ -272,34 +272,37 @@ const SPECS: Record<string, DialogSpec> = {
     },
   },
   glm_multivariate: {
-    title: 'Multivariate (MANOVA)',
+    title: 'Multivariate (MANOVA / MANCOVA)',
     procedure: 'glm_multivariate',
     slots: [
       { key: 'dependents', label: 'Dependent Variables', multiple: true },
-      { key: 'factor', label: 'Fixed Factor', multiple: false },
+      { key: 'factors', label: 'Fixed Factor(s)', multiple: true },
+      { key: 'covariates', label: 'Covariate(s)', multiple: true },
     ],
     collect: (m) => {
       const dependents = m.values('dependents');
-      const factor = m.values('factor');
+      const factors = m.values('factors');
+      const covariates = m.values('covariates');
       if (dependents.length < 2) return 'Select at least two dependent variables.';
-      if (factor.length !== 1) return 'Select one fixed factor.';
-      return { dependents, factor: factor[0] };
+      if (factors.length === 0 && covariates.length === 0)
+        return 'Add at least one factor or covariate.';
+      return { dependents, factors, covariates };
     },
   },
   mixed_model: {
-    title: 'Linear Mixed Model (random intercept)',
+    title: 'Linear Mixed Model (Crossed/Nested)',
     procedure: 'mixed_model',
     slots: [
       { key: 'dependent', label: 'Dependent Variable', multiple: false },
-      { key: 'subject', label: 'Subject / Grouping (random)', multiple: false },
+      { key: 'randomFactors', label: 'Random Factor(s) / Grouping', multiple: true },
       { key: 'covariates', label: 'Covariate(s)', multiple: true },
     ],
     collect: (m) => {
       const dep = m.values('dependent');
-      const subject = m.values('subject');
+      const randomFactors = m.values('randomFactors');
       if (dep.length !== 1) return 'Select exactly one dependent variable.';
-      if (subject.length !== 1) return 'Select one subject/grouping variable.';
-      return { dependent: dep[0], subject: subject[0], covariates: m.values('covariates') };
+      if (randomFactors.length === 0) return 'Select at least one random factor.';
+      return { dependent: dep[0], randomFactors, covariates: m.values('covariates') };
     },
   },
   survival_km: {
@@ -328,21 +331,25 @@ const SPECS: Record<string, DialogSpec> = {
     title: 'Cox Regression',
     procedure: 'cox_regression',
     slots: [
-      { key: 'time', label: 'Time', multiple: false },
+      { key: 'time', label: 'Time (Stop)', multiple: false },
       { key: 'status', label: 'Status', multiple: false },
       { key: 'covariates', label: 'Covariates', multiple: true },
+      { key: 'startTime', label: 'Start Time (optional)', multiple: false },
     ],
     extras: (b) => b.appendChild(numberField('Event value (status =)', 'eventValue', '1')),
     collect: (m, b) => {
       const time = m.values('time');
       const status = m.values('status');
       const covariates = m.values('covariates');
+      const startTime = m.values('startTime');
       if (time.length !== 1) return 'Select one time variable.';
       if (status.length !== 1) return 'Select one status variable.';
       if (covariates.length === 0) return 'Select at least one covariate.';
       const eventValue = (b.querySelector('[data-key="eventValue"]') as HTMLInputElement).value.trim();
       if (eventValue === '') return 'Enter the value of the status variable that marks an event.';
-      return { time: time[0], status: status[0], covariates, eventValue };
+      const params: Record<string, unknown> = { time: time[0], status: status[0], covariates, eventValue };
+      if (startTime.length === 1) params['startTime'] = startTime[0];
+      return params;
     },
   },
   glm_repeated: {
