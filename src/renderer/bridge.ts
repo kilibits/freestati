@@ -68,8 +68,14 @@ const electron = {
       offset: number,
       limit: number,
       query?: string,
+      filterCol?: string,
     ): Promise<{ rows: Record<string, unknown>[]; total: number }> {
-      const res = await invoke<{ rows_raw: string; total: number }>('get_page', { offset, limit, query });
+      const res = await invoke<{ rows_raw: string; total: number }>('get_page', {
+        offset,
+        limit,
+        query,
+        filterCol,
+      });
       return { rows: JSON.parse(res.rows_raw), total: res.total };
     },
     getVariables: () => invoke('get_variables'),
@@ -86,8 +92,11 @@ const electron = {
       const bytes = await invoke<number[]>('run_analysis', { procedure, params });
       return decode(new Uint8Array(bytes));
     },
-    chart: (kind: string, params: Record<string, unknown>) =>
-      invoke('run_chart', { kind, params }),
+    chart: async (kind: string, params: Record<string, unknown>) => {
+      const { decode } = await import('@msgpack/msgpack');
+      const bytes = await invoke<number[]>('run_chart', { kind, params });
+      return decode(new Uint8Array(bytes));
+    },
     async exportText(contents: string): Promise<string | null> {
       const path = await saveDialog({
         filters: [{ name: 'HTML', extensions: ['html'] }],

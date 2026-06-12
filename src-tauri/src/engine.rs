@@ -277,10 +277,21 @@ impl Engine {
             }
         }
 
-        let lazy = df.clone().lazy().with_row_index("__row__", Some(1));
+        // Filtered: stamp the ORIGINAL 1-based index with with_row_index BEFORE
+        // filtering, so edits on a filtered view map back to the source row.
+        // Unfiltered: skip it — a full with_row_index().collect() would
+        // materialise the entire frame on every page fetch (O(N) per scroll).
+        // The case number is stamped cheaply on the sliced chunk below instead.
+        let is_filtered = mask.is_some();
         let frame = match mask {
-            Some(m) => lazy.filter(m).collect().map_err(map_err)?,
-            None => lazy.collect().map_err(map_err)?,
+            Some(m) => df
+                .clone()
+                .lazy()
+                .with_row_index("__row__", Some(1))
+                .filter(m)
+                .collect()
+                .map_err(map_err)?,
+            None => df.clone(),
         };
 
         let total = frame.height();
@@ -289,9 +300,16 @@ impl Engine {
         }
         let len = limit.min(total - offset);
         let mut chunk = frame.slice(offset as i64, len);
-        
-        // ... (rest of function)
-        
+
+        // Unfiltered: stamp the 1-based case number on just this chunk. Filtered
+        // frames already carry __row__ (the original index) from with_row_index.
+        if !is_filtered {
+            let row_nums: Vec<i64> = (0..len as i64).map(|i| offset as i64 + 1 + i).collect();
+            let row_col = Series::new("__row__".into(), row_nums);
+            chunk.with_column(row_col).map_err(map_err)?;
+        }
+
+
         // Replace NaN/Inf in float columns with null so the JSON is valid.
         if !self.float_cols.is_empty() {
             let exprs: Vec<Expr> = self

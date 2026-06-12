@@ -162,6 +162,11 @@ fn prep_data(df: &DataFrame, cols: &[String]) -> SResult<DataFrame> {
     lazy.collect().map_err(|e| e.to_string())
 }
 
+/// Stringify any error into the crate's `SResult<_, String>` convention.
+fn map_err<E: std::fmt::Display>(e: E) -> String {
+    e.to_string()
+}
+
 /// Column values aligned by row, `None` for null/non-finite. Length == n rows.
 fn col_opt(df: &DataFrame, name: &str) -> SResult<Vec<Option<f64>>> {
     let s = df
@@ -180,6 +185,21 @@ fn col_opt(df: &DataFrame, name: &str) -> SResult<Vec<Option<f64>>> {
 /// A single numeric column with nulls dropped (valid cases only).
 fn col_valid(df: &DataFrame, name: &str) -> SResult<Vec<f64>> {
     Ok(col_opt(df, name)?.into_iter().flatten().collect())
+}
+
+/// Extract a numeric column from a (listwise-cleaned) DataFrame as a dense
+/// `Vec<f64>`. Returns a user-friendly error instead of panicking when the
+/// variable is missing or non-numeric (e.g. a string picked as a dependent).
+fn df_f64(df: &DataFrame, name: &str) -> SResult<Vec<f64>> {
+    let s = df
+        .column(name)
+        .map_err(|_| format!("No such variable: {name}"))?
+        .as_materialized_series();
+    if !s.dtype().is_numeric() {
+        return Err(format!("'{name}' must be a numeric variable for this analysis"));
+    }
+    let ca = s.cast(&DataType::Float64).map_err(map_err)?;
+    Ok(ca.f64().map_err(map_err)?.into_no_null_iter().collect())
 }
 
 /// Canonical string label per row for a grouping/categorical column. Integral
@@ -236,30 +256,24 @@ fn describe(x: &[f64]) -> Desc {
         };
     }
     let nf = n as f64;
-    let mean = x.par_iter().sum::<f64>() / nf;
+    let mean = x.iter().sum::<f64>() / nf;
 
-    let (min, max, m2) = x
-        .par_iter()
-        .fold(
-            || (x[0], x[0], 0.0),
-            |(mut min, mut max, mut m2), &v| {
-                if v < min {
-                    min = v;
-                }
-                if v > max {
-                    max = v;
-                }
-                let d = v - mean;
-                m2 += d * d;
-                (min, max, m2)
-            },
-        )
-        .reduce(
-            || (x[0], x[0], 0.0),
-            |(min1, max1, m2_1), (min2, max2, m2_2)| {
-                (min1.min(min2), max1.max(max2), m2_1 + m2_2)
-            },
-        );
+    // Sequential single pass: `describe` is called inside tight nested loops
+    // (per group, per item, per dependent), so rayon's split/dispatch overhead
+    // would cost far more than it saves at typical N.
+    let mut min = x[0];
+    let mut max = x[0];
+    let mut m2 = 0.0;
+    for &v in x {
+        if v < min {
+            min = v;
+        }
+        if v > max {
+            max = v;
+        }
+        let d = v - mean;
+        m2 += d * d;
+    }
 
     let variance = if n > 1 { m2 / (nf - 1.0) } else { f64::NAN };
     let sd = variance.sqrt();
@@ -1366,7 +1380,7 @@ impl Engine {
         }
         let k = p + 1; // params including intercept
         let y = Array1::from_vec(y_vec);
-        let x = Array2::from_shape_vec((n, k), x_flat).expect("Failed to create design matrix from shape");
+        let x = Array2::from_shape_vec((n, k), x_flat).map_err(map_err)?;
 
         // Normal equations: (XᵀX) β = Xᵀy.
         let xt = x.t();
@@ -1888,11 +1902,11 @@ impl Engine {
         if n <= p {
             return Err("Not enough complete cases for the number of variables".into());
         }
-        let data = Array2::from_shape_vec((n, p), data_flat).unwrap();
+        let data = Array2::from_shape_vec((n, p), data_flat).map_err(map_err)?;
 
         // Correlation matrix R (p × p).
         let mut corr = Array2::zeros((p, p));
-        let means = data.mean_axis(ndarray::Axis(0)).unwrap();
+        let means = data.mean_axis(ndarray::Axis(0)).ok_or_else(|| "Empty data".to_string())?;
         let mut sds = Array1::zeros(p);
         for j in 0..p {
             let col = data.column(j);
@@ -1919,7 +1933,7 @@ impl Engine {
         // Eigen-decomposition (sorted descending).
         let (eigvals, eigvecs) = jacobi_eigen(&corr);
         let mut order: Vec<usize> = (0..p).collect();
-        order.sort_by(|&a, &b| eigvals[b].partial_cmp(&eigvals[a]).unwrap());
+        order.sort_by(|&a, &b| eigvals[b].partial_cmp(&eigvals[a]).unwrap_or(std::cmp::Ordering::Equal));
 
         // Number of components: fixed count, else Kaiser (eigenvalue > 1).
         let m = match fixed_factors {
@@ -2112,25 +2126,28 @@ impl Engine {
             return Err("Not enough complete cases".into());
         }
 
-        let y: Vec<f64> = clean_df.column(dependent).unwrap().f64().unwrap().into_no_null_iter().collect();
+        let y: Vec<f64> = df_f64(&clean_df, dependent)?;
 
-        // Factor levels.
-        let levels: Vec<Vec<String>> = factors.iter().map(|f| {
-            let mut lv = col_labels(&clean_df, f).unwrap().into_iter().flatten().collect::<Vec<_>>();
+        // Per-factor row labels (extracted once; the columns exist post-prep).
+        let factor_labels: Vec<Vec<Option<String>>> =
+            factors.iter().map(|f| col_labels(&clean_df, f)).collect::<SResult<Vec<_>>>()?;
+
+        // Factor levels (sorted, distinct).
+        let levels: Vec<Vec<String>> = factor_labels.iter().map(|labs| {
+            let mut lv = labs.iter().flatten().cloned().collect::<Vec<_>>();
             lv.sort();
             lv.dedup();
             lv
         }).collect();
 
         let mut effects: Vec<Effect> = Vec::new();
-        for (_ci, cov) in covariates.iter().enumerate() {
-            let col: Vec<f64> = clean_df.column(cov).unwrap().f64().unwrap().into_no_null_iter().collect();
+        for cov in covariates.iter() {
+            let col: Vec<f64> = df_f64(&clean_df, cov)?;
             let n_c = col.len();
-            effects.push(Effect { name: self.display(cov), cols: Array2::from_shape_vec((n_c, 1), col).unwrap() });
+            effects.push(Effect { name: self.display(cov), cols: Array2::from_shape_vec((n_c, 1), col).map_err(map_err)? });
         }
 
-        let dummies: Vec<Vec<Vec<f64>>> = factors.iter().enumerate().map(|(fi, f_name)| {
-            let row_labels = col_labels(&clean_df, f_name).unwrap();
+        let dummies: Vec<Vec<Vec<f64>>> = factor_labels.iter().enumerate().map(|(fi, row_labels)| {
             levels[fi].iter().skip(1).map(|lev| {
                 row_labels.iter().map(|o| if o.as_deref() == Some(lev) { 1.0 } else { 0.0 }).collect()
             }).collect()
@@ -2158,7 +2175,7 @@ impl Engine {
                     flat.push(cols[j][i]);
                 }
             }
-            effects.push(Effect { name, cols: Array2::from_shape_vec((n_r, n_c), flat).unwrap() });
+            effects.push(Effect { name, cols: Array2::from_shape_vec((n_r, n_c), flat).map_err(map_err)? });
         }
 
         let total_cols: usize = effects.iter().map(|e| e.cols.ncols()).sum();
@@ -2171,7 +2188,7 @@ impl Engine {
                 }
             }
         }
-        let x_full = Array2::from_shape_vec((1 + total_cols, n), x_flat).unwrap().reversed_axes(); // n x k
+        let x_full = Array2::from_shape_vec((1 + total_cols, n), x_flat).map_err(map_err)?.reversed_axes(); // n x k
 
         let solve_sse = |x: &Array2<f64>, y: &[f64]| -> Option<f64> {
             let y_arr = Array1::from_vec(y.to_vec());
@@ -2312,27 +2329,30 @@ impl Engine {
 
         let mut y_flat = Vec::with_capacity(n * p);
         for dep in dependents {
-            y_flat.extend(clean_df.column(dep).unwrap().f64().unwrap().into_no_null_iter());
+            y_flat.extend(df_f64(&clean_df, dep)?);
         }
-        let y_data = Array2::from_shape_vec((p, n), y_flat).unwrap(); // p x n
+        let y_data = Array2::from_shape_vec((p, n), y_flat).map_err(map_err)?; // p x n
 
         // Design matrix.
         let mut effects: Vec<Effect> = Vec::new();
-        for (_ci, cov) in covariates.iter().enumerate() {
-            let col: Vec<f64> = clean_df.column(cov).unwrap().f64().unwrap().into_no_null_iter().collect();
+        for cov in covariates.iter() {
+            let col: Vec<f64> = df_f64(&clean_df, cov)?;
             let n_c = col.len();
-            effects.push(Effect { name: self.display(cov), cols: Array2::from_shape_vec((n_c, 1), col).unwrap() });
+            effects.push(Effect { name: self.display(cov), cols: Array2::from_shape_vec((n_c, 1), col).map_err(map_err)? });
         }
 
-        let levels: Vec<Vec<String>> = factors.iter().map(|f| {
-            let mut lv = col_labels(&clean_df, f).unwrap().into_iter().flatten().collect::<Vec<_>>();
+        // Per-factor row labels (extracted once; the columns exist post-prep).
+        let factor_labels: Vec<Vec<Option<String>>> =
+            factors.iter().map(|f| col_labels(&clean_df, f)).collect::<SResult<Vec<_>>>()?;
+
+        let levels: Vec<Vec<String>> = factor_labels.iter().map(|labs| {
+            let mut lv = labs.iter().flatten().cloned().collect::<Vec<_>>();
             lv.sort();
             lv.dedup();
             lv
         }).collect();
 
-        let dummies: Vec<Vec<Vec<f64>>> = factors.iter().enumerate().map(|(fi, f_name)| {
-            let row_labels = col_labels(&clean_df, f_name).unwrap();
+        let dummies: Vec<Vec<Vec<f64>>> = factor_labels.iter().enumerate().map(|(fi, row_labels)| {
             levels[fi].iter().skip(1).map(|lev| {
                 row_labels.iter().map(|o| if o.as_deref() == Some(lev) { 1.0 } else { 0.0 }).collect()
             }).collect()
@@ -2360,7 +2380,7 @@ impl Engine {
                     flat.push(cols[j][i]);
                 }
             }
-            effects.push(Effect { name, cols: Array2::from_shape_vec((n_r, n_c), flat).unwrap() });
+            effects.push(Effect { name, cols: Array2::from_shape_vec((n_r, n_c), flat).map_err(map_err)? });
         }
 
         let total_k = 1 + effects.iter().map(|e| e.cols.ncols()).sum::<usize>();
@@ -2373,7 +2393,7 @@ impl Engine {
                 }
             }
         }
-        let x = Array2::from_shape_vec((total_k, n), x_flat).unwrap().reversed_axes(); // n x total_k
+        let x = Array2::from_shape_vec((total_k, n), x_flat).map_err(map_err)?.reversed_axes(); // n x total_k
         let df_e = (n - total_k) as f64;
         if df_e <= 0.0 {
             return Err("Too many parameters for the number of cases".into());
@@ -2442,7 +2462,7 @@ impl Engine {
         let (mut eig, _) = jacobi_eigen(&s_mat);
         eig.mapv_inplace(|l| if l < 0.0 { 0.0 } else { l });
         let mut eig_vec = eig.to_vec();
-        eig_vec.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        eig_vec.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
 
         let pillai: f64 = eig_vec.iter().map(|&l| l / (1.0 + l)).sum();
         let wilks: f64 = eig_vec.iter().map(|&l| 1.0 / (1.0 + l)).product();
@@ -2509,7 +2529,7 @@ impl Engine {
         all_cols.extend(covariates.iter().cloned());
         let clean_df = prep_data(df, &all_cols)?;
 
-        let y: Vec<f64> = clean_df.column(dependent).unwrap().f64().unwrap().into_no_null_iter().collect();
+        let y: Vec<f64> = df_f64(&clean_df, dependent)?;
         let subj = col_labels(&clean_df, subject)?;
         
         let n = y.len();
@@ -2518,9 +2538,9 @@ impl Engine {
         let mut x_flat = Vec::with_capacity(n * p);
         x_flat.extend(std::iter::repeat(1.0).take(n));
         for c in covariates {
-            x_flat.extend(clean_df.column(c).unwrap().f64().unwrap().into_no_null_iter());
+            x_flat.extend(df_f64(&clean_df, c)?);
         }
-        let x = Array2::from_shape_vec((p, n), x_flat).unwrap().reversed_axes(); // n x p
+        let x = Array2::from_shape_vec((p, n), x_flat).map_err(map_err)?.reversed_axes(); // n x p
 
         if n <= p + 1 {
             return Err("Not enough complete cases".into());
@@ -2679,7 +2699,7 @@ impl Engine {
         all_cols.extend(covariates.iter().cloned());
         let clean_df = prep_data(df, &all_cols)?;
 
-        let y_vec: Vec<f64> = clean_df.column(dependent).unwrap().f64().unwrap().into_no_null_iter().collect();
+        let y_vec: Vec<f64> = df_f64(&clean_df, dependent)?;
         let y = Array1::from_vec(y_vec);
         
         let n = y.len();
@@ -2693,9 +2713,9 @@ impl Engine {
         let mut x_flat = Vec::with_capacity(n * p);
         x_flat.extend(std::iter::repeat(1.0).take(n));
         for c in covariates {
-            x_flat.extend(clean_df.column(c).unwrap().f64().unwrap().into_no_null_iter());
+            x_flat.extend(df_f64(&clean_df, c)?);
         }
-        let x = Array2::from_shape_vec((p, n), x_flat).unwrap().reversed_axes();
+        let x = Array2::from_shape_vec((p, n), x_flat).map_err(map_err)?.reversed_axes();
 
         if n <= p + q {
             return Err("Not enough complete cases".into());
@@ -2704,7 +2724,7 @@ impl Engine {
         // Build Z matrices.
         let mut z: Vec<Array2<f64>> = Vec::new();
         for rf_name in random_factors {
-            let labels = col_labels(&clean_df, rf_name).unwrap();
+            let labels = col_labels(&clean_df, rf_name)?;
             let unique: BTreeSet<String> = labels.iter().cloned().flatten().collect();
             let levels: Vec<String> = unique.into_iter().collect();
             let n_l = levels.len();
@@ -2958,18 +2978,18 @@ impl Engine {
         all_cols.extend(covariates.iter().cloned());
         let clean_df = prep_data(df, &all_cols)?;
 
-        let t_stop: Vec<f64> = clean_df.column(time).unwrap().f64().unwrap().into_no_null_iter().collect();
+        let t_stop: Vec<f64> = df_f64(&clean_df, time)?;
         let t_start: Vec<f64> = match start_time {
-            Some(s) => clean_df.column(s).unwrap().f64().unwrap().into_no_null_iter().collect(),
+            Some(s) => df_f64(&clean_df, s)?,
             None => vec![0.0; t_stop.len()],
         };
         let ev: Vec<bool> = col_labels(&clean_df, status)?.into_iter().map(|o| o == Some(event_value.into())).collect();
         
         let mut x_flat = Vec::with_capacity(t_stop.len() * p);
         for c in covariates {
-            x_flat.extend(clean_df.column(c).unwrap().f64().unwrap().into_no_null_iter());
+            x_flat.extend(df_f64(&clean_df, c)?);
         }
-        let x = Array2::from_shape_vec((p, t_stop.len()), x_flat).unwrap().reversed_axes(); // n x p
+        let x = Array2::from_shape_vec((p, t_stop.len()), x_flat).map_err(map_err)?.reversed_axes(); // n x p
 
         let n = t_stop.len();
         let n_events = ev.iter().filter(|&&e| e).count();
@@ -2981,7 +3001,7 @@ impl Engine {
         }
 
         // Centre covariates.
-        let means = x.mean_axis(ndarray::Axis(0)).unwrap();
+        let means = x.mean_axis(ndarray::Axis(0)).ok_or_else(|| "Empty data".to_string())?;
         let x_centered = &x - &means;
 
         let mut event_times: Vec<f64> = Vec::new();
@@ -3724,6 +3744,7 @@ fn greenhouse_geisser(data: &[Vec<f64>], means: &[f64]) -> f64 {
     let kf = k as f64;
     let diag_mean: f64 = s.diag().mean().unwrap();
     let grand: f64 = s.mean().unwrap();
+    // k ≥ 2 is guaranteed above, so the covariance matrix is non-empty.
     let row_means = s.mean_axis(ndarray::Axis(1)).unwrap();
     let sum_sq = s.mapv(|v| v * v).sum();
     let sum_row_sq = row_means.mapv(|v| v * v).sum();

@@ -12,15 +12,16 @@ alongside `.tsv` and `.csv`.
 - **Statistical procedures** — Descriptives, Frequencies, Crosstabs (chi-square,
   Cramér's V), t-tests (one-sample, independent with Levene's test, paired) with
   Cohen's d and 95% CIs, one-way ANOVA with post-hoc (LSD/Bonferroni/Tukey HSD)
-  and η², GLM Univariate (factorial ANOVA/ANCOVA, Type III SS), correlation
-  GLM Multivariate (one-way MANOVA: Pillai/Wilks/Hotelling/Roy) and Repeated
-  Measures (within-subjects ANOVA + Greenhouse-Geisser), correlation
-  (Pearson/Spearman), linear regression with coefficient CIs, factor analysis
-  (PCA with varimax), reliability (Cronbach's α), linear mixed models (random
-  intercept, **REML**), survival analysis (Kaplan-Meier + log-rank and **Cox
-  proportional-hazards** regression), and nonparametric tests (Mann-Whitney U,
-  Wilcoxon, Kruskal-Wallis, chi-square) — all computed natively in Rust with no
-  external stats dependency
+  and η², GLM Univariate (factorial ANOVA/ANCOVA, Type III SS), GLM Multivariate
+  (MANOVA/**MANCOVA**: Pillai/Wilks/Hotelling/Roy), Repeated Measures
+  (within-subjects ANOVA + Greenhouse-Geisser), correlation (Pearson/Spearman),
+  linear regression with coefficient CIs, factor analysis (PCA with varimax),
+  reliability (Cronbach's α), linear mixed models (**REML**; random intercept and
+  **crossed/nested random effects**), survival analysis (Kaplan-Meier + log-rank
+  and **Cox proportional-hazards** regression, including **time-varying
+  (start–stop) covariates**), and nonparametric tests (Mann-Whitney U, Wilcoxon,
+  Kruskal-Wallis, chi-square) — all computed natively in Rust with no external
+  stats dependency
 - **Syntax & scripting** — every analysis and chart is recorded as a replayable
   command in a Syntax editor; edit, save/open `.fst` scripts, and re-run an
   entire session for reproducibility
@@ -171,7 +172,7 @@ scripts/build-renderer.mjs esbuild bundler
 ## Roadmap
 
 - Restore `.xlsx` / `.dta` / `.sas7bdat` reading and `.sav` writing in the Rust engine
-- Time-varying Cox covariates, crossed/nested random effects, multivariate GLM contrasts
+- Larger-than-RAM analysis (streaming/out-of-core), GPU-accelerated linear algebra
 - Tauri auto-updater
 
 ## License

@@ -154,7 +154,9 @@ fn run_analysis(
     params: JsonValue,
 ) -> Result<Vec<u8>, String> {
     let analysis = state.lock().unwrap().run_analysis(&procedure, &params)?;
-    rmp_serde::to_vec(&analysis).map_err(|e| e.to_string())
+    // `to_vec_named` encodes structs as maps so the JS side gets {title, tables}.
+    // (`to_vec` would emit positional arrays — losing every field name.)
+    rmp_serde::to_vec_named(&analysis).map_err(|e| e.to_string())
 }
 
 #[tauri::command(async)]
@@ -162,8 +164,10 @@ fn run_chart(
     state: State<EngineState>,
     kind: String,
     params: JsonValue,
-) -> Result<stats::ChartData, String> {
-    state.lock().unwrap().run_chart(&kind, &params)
+) -> Result<Vec<u8>, String> {
+    let chart = state.lock().unwrap().run_chart(&kind, &params)?;
+    // Same compact msgpack path as run_analysis (named so JS gets an object).
+    rmp_serde::to_vec_named(&chart).map_err(|e| e.to_string())
 }
 
 /// Write text (e.g. exported output HTML) to a path chosen via the save dialog.

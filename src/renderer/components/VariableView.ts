@@ -26,7 +26,7 @@ const COL_DEFS: ColDef<Variable>[] = [
   { field: 'decimals', headerName: 'Decimals', width: 80, editable: () => dataStore.get().editMode, type: 'numericColumn' },
   { field: 'label', headerName: 'Label', width: 250, editable: () => dataStore.get().editMode },
   {
-    field: 'values',
+    colId: 'values',
     headerName: 'Values',
     width: 120,
     valueGetter: (p) => {
@@ -43,7 +43,7 @@ const COL_DEFS: ColDef<Variable>[] = [
     },
   },
   {
-    field: 'missing',
+    colId: 'missing',
     headerName: 'Missing',
     width: 100,
     valueGetter: (p) => {
