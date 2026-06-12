@@ -27,6 +27,7 @@ export class DataView {
 
   private searchQuery = '';
   private searchTimer: number | null = null;
+  private loadedEditMode = false;
 
   mount(container: HTMLElement): void {
     this.container = container;
@@ -127,9 +128,16 @@ export class DataView {
 
     const signature = `${state.path ?? ''}|${state.rowCount}|${state.colCount}`;
     if (signature === this.loadedSignature) {
-      return; // same dataset — a non-structural change (e.g. modified flag)
+      // Same dataset — but if edit mode toggled, re-apply column editability
+      // (no grid rebuild needed; column defs can be swapped at runtime).
+      if (state.editMode !== this.loadedEditMode) {
+        this.loadedEditMode = state.editMode;
+        this.refresh();
+      }
+      return;
     }
     this.loadedSignature = signature;
+    this.loadedEditMode = state.editMode;
 
     const blockSize = this.blockSizeFor(state.variables.length);
     this.rebuild(blockSize, this.buildColumnDefs(state.variables), this.buildDatasource(state.rowCount));
@@ -163,6 +171,7 @@ export class DataView {
   }
 
   private buildColumnDefs(variables: Variable[]): ColDef[] {
+    const editable = dataStore.get().editMode;
     return [
       {
         headerName: '#',
@@ -179,7 +188,7 @@ export class DataView {
         field: v.name,
         headerName: v.name,
         headerTooltip: v.label || v.name,
-        editable: true,
+        editable,
         width: Math.max(100, v.width * 10),
         valueFormatter: (params) => {
           if (params.value == null) return '';

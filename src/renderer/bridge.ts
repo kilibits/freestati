@@ -93,6 +93,18 @@ const electron = {
       await invoke('save_text_file', { path, contents });
       return path;
     },
+    async exportSvg(contents: string): Promise<string | null> {
+      const path = await saveDialog({ filters: [{ name: 'SVG Image', extensions: ['svg'] }] });
+      if (!path) return null;
+      await invoke('save_text_file', { path, contents });
+      return path;
+    },
+    async exportPng(bytes: number[]): Promise<string | null> {
+      const path = await saveDialog({ filters: [{ name: 'PNG Image', extensions: ['png'] }] });
+      if (!path) return null;
+      await invoke('save_binary_file', { path, bytes });
+      return path;
+    },
   },
 
   // ── Generic command pass-through (e.g. python.execute('new_dataset')) ───────

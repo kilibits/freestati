@@ -21,6 +21,9 @@ const COLORS = {
   axis: '#3d4466',
 };
 
+/** Qualitative palette for multi-series charts (line, clustered bar). */
+const PALETTE = ['#6366f1', '#10b981', '#f59e0b', '#ef4444', '#06b6d4', '#a855f7', '#84cc16', '#ec4899'];
+
 /** Render a chart to an SVG element. */
 export function renderChart(chart: ChartData): SVGSVGElement {
   const svg = el('svg', {
@@ -42,6 +45,12 @@ export function renderChart(chart: ChartData): SVGSVGElement {
       break;
     case 'box':
       drawBox(svg, chart);
+      break;
+    case 'line':
+      drawLine(svg, chart);
+      break;
+    case 'clustered_bar':
+      drawClusteredBar(svg, chart);
       break;
   }
   return svg;
@@ -206,6 +215,80 @@ function drawBox(svg: SVGSVGElement, chart: ChartData): void {
         fill: COLORS.muted,
         'font-size': '10',
       }),
+    );
+  });
+}
+
+function drawLine(svg: SVGSVGElement, chart: ChartData): void {
+  type Series = { label: string; points: [number, number][] };
+  const series = (chart.payload['series'] as Series[]) ?? [];
+  const pts = series.flatMap((s) => s.points);
+  if (pts.length === 0) return;
+  const xs = pts.map((p) => p[0]);
+  const ys = pts.map((p) => p[1]);
+  const xMin = Math.min(...xs);
+  const xMax = Math.max(...xs);
+  const yMin = Math.min(...ys);
+  const yMax = Math.max(...ys);
+  axes(svg, chart, xMin, xMax, yMin, yMax);
+  const sx = (v: number) => M.left + ((v - xMin) / (xMax - xMin || 1)) * PLOT_W;
+  const sy = (v: number) => M.top + PLOT_H - ((v - yMin) / (yMax - yMin || 1)) * PLOT_H;
+
+  series.forEach((s, i) => {
+    const color = PALETTE[i % PALETTE.length]!;
+    const d = s.points.map((p, j) => `${j === 0 ? 'M' : 'L'}${sx(p[0])},${sy(p[1])}`).join(' ');
+    svg.appendChild(el('path', { d, fill: 'none', stroke: color, 'stroke-width': '1.5' }));
+  });
+  if (series.length > 1) legend(svg, series.map((s) => s.label));
+}
+
+function drawClusteredBar(svg: SVGSVGElement, chart: ChartData): void {
+  type Series = { label: string; counts: number[] };
+  const categories = (chart.payload['categories'] as string[]) ?? [];
+  const series = (chart.payload['series'] as Series[]) ?? [];
+  if (categories.length === 0 || series.length === 0) return;
+  const maxCount = Math.max(...series.flatMap((s) => s.counts), 1);
+  axes(svg, chart, 0, 1, 0, maxCount, /*numericX*/ false);
+  const sy = (v: number) => M.top + PLOT_H - (v / maxCount) * PLOT_H;
+
+  const slot = PLOT_W / categories.length;
+  const groupW = Math.min(slot * 0.8, 72);
+  const barW = groupW / series.length;
+  categories.forEach((cat, ci) => {
+    const cx = M.left + slot * (ci + 0.5);
+    const x0 = cx - groupW / 2;
+    series.forEach((s, si) => {
+      const color = PALETTE[si % PALETTE.length]!;
+      const y = sy(s.counts[ci] ?? 0);
+      svg.appendChild(
+        el('rect', {
+          x: String(x0 + si * barW),
+          y: String(y),
+          width: String(Math.max(1, barW - 1)),
+          height: String(M.top + PLOT_H - y),
+          fill: color,
+        }),
+      );
+    });
+    svg.appendChild(
+      text(cx, M.top + PLOT_H + 16, truncate(cat, 10), {
+        'text-anchor': 'middle',
+        fill: COLORS.muted,
+        'font-size': '10',
+      }),
+    );
+  });
+  legend(svg, series.map((s) => s.label));
+}
+
+/** Top-right legend swatches for multi-series charts. */
+function legend(svg: SVGSVGElement, labels: string[]): void {
+  labels.forEach((label, i) => {
+    const y = M.top + 4 + i * 15;
+    const color = PALETTE[i % PALETTE.length]!;
+    svg.appendChild(el('rect', { x: String(W - M.right - 110), y: String(y - 8), width: '10', height: '10', fill: color }));
+    svg.appendChild(
+      text(W - M.right - 95, y, truncate(label, 16), { fill: COLORS.text, 'font-size': '10' }),
     );
   });
 }

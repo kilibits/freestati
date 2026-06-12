@@ -7,15 +7,19 @@ alongside `.tsv` and `.csv`.
 
 ## Features
 
-- **SPSS-style data editor** — Data View and Variable View with inline editing
+- **SPSS-style data editor** — Data View and Variable View; datasets open
+  **read-only** by default, with a toolbar toggle to enable inline editing
 - **Statistical procedures** — Descriptives, Frequencies, Crosstabs (chi-square,
-  Cramér's V), t-tests (one-sample, independent with Levene's test, paired),
-  one-way ANOVA with post-hoc (LSD/Bonferroni), correlation (Pearson/Spearman),
-  linear regression, factor analysis (PCA with varimax), and nonparametric tests
+  Cramér's V), t-tests (one-sample, independent with Levene's test, paired) with
+  Cohen's d and 95% CIs, one-way ANOVA with post-hoc (LSD/Bonferroni/Tukey HSD)
+  and η², GLM Univariate (factorial ANOVA/ANCOVA, Type III SS), correlation
+  (Pearson/Spearman), linear regression with coefficient CIs, factor analysis
+  (PCA with varimax), reliability (Cronbach's α), and nonparametric tests
   (Mann-Whitney U, Wilcoxon, Kruskal-Wallis, chi-square) — all computed natively
   in Rust with no external stats dependency
-- **Charts** — histogram, bar, scatter (with fit line), and box plots, drawn as
-  dependency-free SVG from engine-side aggregates
+- **Charts** — histogram, bar, clustered bar, line, scatter (with fit line), and
+  box plots, drawn as dependency-free SVG from engine-side aggregates; export any
+  chart to SVG or PNG
 - **Output viewer** — an SPSS-style results pane that accumulates tables and
   charts, with per-table copy/transpose and HTML export of the whole session
 - **File Explorer sidebar** — open a whole folder and load datasets on demand
@@ -158,8 +162,8 @@ scripts/build-renderer.mjs esbuild bundler
 ## Roadmap
 
 - Restore `.xlsx` / `.dta` / `.sas7bdat` reading and `.sav` writing in the Rust engine
-- More procedures (reliability, GLM) and options (Tukey HSD, effect sizes, CIs)
-- More chart types (line, clustered bar) and chart export to PNG/SVG
+- More procedures (GLM multivariate, mixed models, survival) and options
+- Pivot-table editing in the output viewer; export to PDF/Word
 - Tauri auto-updater
 
 ## License

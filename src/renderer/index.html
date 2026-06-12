@@ -17,14 +17,10 @@
       <span class="titlebar-title">FreeStati</span>
     </div>
 
-    <!-- Toolbar -->
+    <!-- Toolbar: only the read-only / edit-mode toggle (all other actions
+         live in the menu bar). -->
     <div class="toolbar">
-      <button id="btn-explorer"    class="toolbar-btn active" title="Toggle File Explorer">⊞</button>
-      <button id="btn-open-folder" class="toolbar-btn"        title="Open Folder in Explorer">📁</button>
-      <div class="toolbar-sep"></div>
-      <button id="btn-new"  class="toolbar-btn" title="New Dataset (Ctrl+N)">New</button>
-      <button id="btn-open" class="toolbar-btn" title="Open File (Ctrl+O)">Open…</button>
-      <button id="btn-save" class="toolbar-btn" title="Save (Ctrl+S)">Save</button>
+      <button id="btn-edit-toggle" class="toolbar-btn" title="Datasets open read-only; click to allow editing">🔒 Read-only</button>
     </div>
 
     <!-- Body: sidebar + main content -->

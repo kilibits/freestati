@@ -17,9 +17,11 @@ const ANALYZE_PROCEDURES = [
   'ttest_independent',
   'ttest_paired',
   'anova_oneway',
+  'glm_univariate',
   'correlate',
   'regression_linear',
   'factor',
+  'reliability',
   'mann_whitney',
   'wilcoxon',
   'kruskal_wallis',
@@ -27,7 +29,7 @@ const ANALYZE_PROCEDURES = [
 ];
 
 /** Charts wired to "menu:graph:<kind>" events from the native menu. */
-const GRAPH_KINDS = ['histogram', 'bar', 'scatter', 'box'];
+const GRAPH_KINDS = ['histogram', 'bar', 'clustered_bar', 'line', 'scatter', 'box'];
 
 export class App {
   private dataView = new DataView();
@@ -84,9 +86,7 @@ export class App {
 
   private applySidebarState(): void {
     const layout = document.getElementById('layout')!;
-    const btn = document.getElementById('btn-explorer') as HTMLButtonElement;
     layout.classList.toggle('sidebar-hidden', !this.sidebarOpen);
-    if (btn) btn.classList.toggle('active', this.sidebarOpen);
   }
 
   // ── Tab switching ─────────────────────────────────────────────────────────
@@ -113,14 +113,27 @@ export class App {
   // ── Toolbar ───────────────────────────────────────────────────────────────
 
   private bindToolbar(): void {
-    document.getElementById('btn-explorer')?.addEventListener('click', () => this.toggleSidebar());
-    document.getElementById('btn-open-folder')?.addEventListener('click', () => {
-      if (!this.sidebarOpen) this.toggleSidebar();
-      this.fileExplorer.openFolderDialog();
+    const toggle = document.getElementById('btn-edit-toggle') as HTMLButtonElement | null;
+    toggle?.addEventListener('click', () => {
+      const { loaded, editMode } = dataStore.get();
+      if (!loaded) return;
+      dataStore.setEditMode(!editMode);
     });
-    document.getElementById('btn-new')?.addEventListener('click', () => this.newDataset());
-    document.getElementById('btn-open')?.addEventListener('click', () => this.openFile());
-    document.getElementById('btn-save')?.addEventListener('click', () => this.save());
+    // Reflect edit-mode state on the toggle button.
+    dataStore.subscribe(() => this.refreshEditToggle());
+    this.refreshEditToggle();
+  }
+
+  private refreshEditToggle(): void {
+    const toggle = document.getElementById('btn-edit-toggle') as HTMLButtonElement | null;
+    if (!toggle) return;
+    const { loaded, editMode } = dataStore.get();
+    toggle.disabled = !loaded;
+    toggle.textContent = editMode ? '🔓 Editing' : '🔒 Read-only';
+    toggle.classList.toggle('active', editMode);
+    toggle.title = editMode
+      ? 'Editing enabled — click to make the dataset read-only'
+      : 'Dataset is read-only — click to allow editing';
   }
 
   // ── Native menu events ────────────────────────────────────────────────────
@@ -128,6 +141,10 @@ export class App {
   private bindMenuEvents(): void {
     window.electron.menu.on('menu:file:new', () => this.newDataset());
     window.electron.menu.on('menu:file:open', () => this.openFile());
+    window.electron.menu.on('menu:file:openFolder', () => {
+      if (!this.sidebarOpen) this.toggleSidebar();
+      this.fileExplorer.openFolderDialog();
+    });
     window.electron.menu.on('menu:file:save', () => this.save());
     window.electron.menu.on('menu:file:saveAs', () => this.saveAs());
     window.electron.menu.on('menu:view:dataView', () => this.switchView('data'));
@@ -167,6 +184,7 @@ export class App {
     }
     await window.electron.python.execute('new_dataset');
     dataStore.reset();
+    dataStore.setEditMode(true); // a fresh dataset is editable so you can enter data
   }
 
   private async openFile(): Promise<void> {

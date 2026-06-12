@@ -83,8 +83,9 @@ html, body, #app {
   transition: background 0.12s, border-color 0.12s;
   white-space: nowrap;
 }
-.toolbar-btn:hover   { background: var(--accent); border-color: var(--accent); }
+.toolbar-btn:hover:not(:disabled) { background: var(--accent); border-color: var(--accent); }
 .toolbar-btn.active  { background: var(--accent); border-color: var(--accent); }
+.toolbar-btn:disabled { opacity: 0.45; cursor: default; }
 
 /* ── Layout (sidebar + content) ───────────────────────────────────────────── */
 .layout {

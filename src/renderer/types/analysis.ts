@@ -18,7 +18,7 @@ export interface Analysis {
 /** Computed chart data; `payload` shape depends on `kind`. */
 export interface ChartData {
   title: string;
-  kind: 'histogram' | 'bar' | 'scatter' | 'box';
+  kind: 'histogram' | 'bar' | 'scatter' | 'box' | 'line' | 'clustered_bar';
   xLabel: string;
   yLabel: string;
   payload: Record<string, unknown>;

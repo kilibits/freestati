@@ -126,6 +126,15 @@ fn p_str_opt(params: &JsonValue, key: &str) -> Option<String> {
     params.get(key).and_then(|v| v.as_str()).map(String::from)
 }
 
+/// Optional string array (empty if absent) — for GLM factors/covariates.
+fn p_strs_opt(params: &JsonValue, key: &str) -> Vec<String> {
+    params
+        .get(key)
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default()
+}
+
 // ── Data extraction ──────────────────────────────────────────────────────────
 
 /// Column values aligned by row, `None` for null/non-finite. Length == n rows.
@@ -435,6 +444,25 @@ fn t_sig_2tailed(t: f64, df: f64) -> f64 {
     betai(df / 2.0, 0.5, df / (df + t * t))
 }
 
+/// Critical (positive) t value for a two-tailed area `alpha` and `df` — i.e. the
+/// t with `t_sig_2tailed(t, df) == alpha`. Found by bisection (the p-value is
+/// monotone decreasing in t for t ≥ 0). Used for confidence intervals.
+fn t_crit(alpha: f64, df: f64) -> f64 {
+    if df <= 0.0 || alpha <= 0.0 || alpha >= 1.0 {
+        return f64::NAN;
+    }
+    let (mut lo, mut hi) = (0.0_f64, 1.0e6_f64);
+    for _ in 0..200 {
+        let mid = 0.5 * (lo + hi);
+        if t_sig_2tailed(mid, df) > alpha {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    0.5 * (lo + hi)
+}
+
 /// Upper-tail p-value for F(df1, df2). F = 0 yields p = 1.
 fn f_sig(f: f64, df1: f64, df2: f64) -> f64 {
     if df1 <= 0.0 || df2 <= 0.0 || f < 0.0 || !f.is_finite() {
@@ -449,6 +477,69 @@ fn chi2_sig(x: f64, df: f64) -> f64 {
         return 1.0;
     }
     gammq(df / 2.0, x / 2.0)
+}
+
+/// Composite Simpson's rule for ∫_a^b f over `n` (even) subintervals.
+fn simpson<F: Fn(f64) -> f64>(f: F, a: f64, b: f64, n: usize) -> f64 {
+    let n = if n % 2 == 0 { n } else { n + 1 };
+    let h = (b - a) / n as f64;
+    let mut sum = f(a) + f(b);
+    for i in 1..n {
+        let x = a + i as f64 * h;
+        sum += if i % 2 == 1 { 4.0 } else { 2.0 } * f(x);
+    }
+    sum * h / 3.0
+}
+
+/// CDF of the range of `k` i.i.d. standard normals at `w`:
+/// k ∫ φ(z) [Φ(z) − Φ(z − w)]^(k−1) dz.
+fn range_cdf(w: f64, k: f64) -> f64 {
+    if w <= 0.0 {
+        return 0.0;
+    }
+    let kf = k;
+    let integrand = |z: f64| {
+        let inner = normal_cdf(z) - normal_cdf(z - w);
+        if inner <= 0.0 {
+            0.0
+        } else {
+            normal_pdf(z) * inner.powf(kf - 1.0)
+        }
+    };
+    (kf * simpson(integrand, -8.0, 8.0, 400)).clamp(0.0, 1.0)
+}
+
+fn normal_pdf(z: f64) -> f64 {
+    (-0.5 * z * z).exp() / (2.0 * std::f64::consts::PI).sqrt()
+}
+
+/// CDF of the studentized range Q(q; k, df): P(studentized range ≤ q) for `k`
+/// groups and `df` error degrees of freedom. Integrates `range_cdf(q·s)` over
+/// the sampling distribution of s = √(χ²_df / df). Used for Tukey HSD p-values.
+fn ptukey(q: f64, k: f64, df: f64) -> f64 {
+    if q <= 0.0 {
+        return 0.0;
+    }
+    if df > 25_000.0 {
+        return range_cdf(q, k);
+    }
+    let f = df;
+    let log_c = std::f64::consts::LN_2 + (f / 2.0) * (f / 2.0).ln() - ln_gamma(f / 2.0);
+    let dens = |s: f64| {
+        if s <= 0.0 {
+            0.0
+        } else {
+            (log_c + (f - 1.0) * s.ln() - f * s * s / 2.0).exp()
+        }
+    };
+    // χ²_df mass lies below f + ~10√(2f); map back to s = √(χ²/df).
+    let s_max = ((f + 10.0 * (2.0 * f).sqrt()) / f).sqrt().max(1.5);
+    simpson(|s| dens(s) * range_cdf(q * s, k), 0.0, s_max, 400).clamp(0.0, 1.0)
+}
+
+/// Tukey HSD p-value: upper tail of the studentized range.
+fn tukey_sig(q: f64, k: f64, df: f64) -> f64 {
+    (1.0 - ptukey(q, k, df)).clamp(0.0, 1.0)
 }
 
 /// Standard normal CDF Φ(z).
@@ -527,6 +618,13 @@ impl Engine {
                 self.kruskal_wallis(df, &p_strs(params, "vars")?, &p_str(params, "factor")?)
             }
             "chi_square" => self.chi_square(df, &p_strs(params, "vars")?),
+            "reliability" => self.reliability(df, &p_strs(params, "vars")?),
+            "glm_univariate" => self.glm_univariate(
+                df,
+                &p_str(params, "dependent")?,
+                &p_strs_opt(params, "factors"),
+                &p_strs_opt(params, "covariates"),
+            ),
             other => Err(format!("Unknown procedure: {other}")),
         }
     }
@@ -679,9 +777,12 @@ impl Engine {
                 "df",
                 "Sig. (2-tailed)",
                 "Mean Difference",
+                "Cohen's d",
+                "95% CI Lower",
+                "95% CI Upper",
             ],
         )
-        .footnote(format!("Test Value = {test_value}"));
+        .footnote(format!("Test Value = {test_value}; 95% CI of the mean difference."));
 
         for v in vars {
             let x = col_valid(df, v)?;
@@ -694,13 +795,18 @@ impl Engine {
                 num(d.sem),
             ]);
             let df_t = d.n as f64 - 1.0;
-            let t = (d.mean - test_value) / d.sem;
+            let mean_diff = d.mean - test_value;
+            let t = mean_diff / d.sem;
+            let margin = t_crit(0.05, df_t) * d.sem;
             test.rows.push(vec![
                 text(self.display(v)),
                 num(t),
                 num(df_t),
                 num(t_sig_2tailed(t, df_t)),
-                num(d.mean - test_value),
+                num(mean_diff),
+                num(mean_diff / d.sd),
+                num(mean_diff - margin),
+                num(mean_diff + margin),
             ]);
         }
         Ok(Analysis {
@@ -737,8 +843,12 @@ impl Engine {
                 "Sig. (2-tailed)",
                 "Mean Difference",
                 "Std. Error Difference",
+                "Cohen's d",
+                "95% CI Lower",
+                "95% CI Upper",
             ],
-        );
+        )
+        .footnote("95% CI of the mean difference. Cohen's d uses the pooled standard deviation.");
 
         for v in vars {
             let xs = col_opt(df, v)?;
@@ -798,6 +908,11 @@ impl Engine {
                 / ((da.variance / n1).powi(2) / (n1 - 1.0)
                     + (db.variance / n2).powi(2) / (n2 - 1.0));
 
+            // Cohen's d with the pooled SD; 95% CI of the mean difference.
+            let cohens_d = mean_diff / sp2.sqrt();
+            let margin_pool = t_crit(0.05, df_pool) * se_pool;
+            let margin_welch = t_crit(0.05, df_welch) * se_welch;
+
             test.rows.push(vec![
                 text(self.display(v)),
                 text("Equal variances assumed"),
@@ -806,6 +921,9 @@ impl Engine {
                 num(t_sig_2tailed(t_pool, df_pool)),
                 num(mean_diff),
                 num(se_pool),
+                num(cohens_d),
+                num(mean_diff - margin_pool),
+                num(mean_diff + margin_pool),
             ]);
             test.rows.push(vec![
                 text(""),
@@ -815,6 +933,9 @@ impl Engine {
                 num(t_sig_2tailed(t_welch, df_welch)),
                 num(mean_diff),
                 num(se_welch),
+                num(cohens_d),
+                num(mean_diff - margin_welch),
+                num(mean_diff + margin_welch),
             ]);
         }
         Ok(Analysis {
@@ -838,8 +959,12 @@ impl Engine {
                 "t",
                 "df",
                 "Sig. (2-tailed)",
+                "Cohen's d",
+                "95% CI Lower",
+                "95% CI Upper",
             ],
-        );
+        )
+        .footnote("95% CI of the mean difference; Cohen's d = mean difference / SD of differences.");
         for (i, (a, b)) in pairs.iter().enumerate() {
             let xa = col_opt(df, a)?;
             let xb = col_opt(df, b)?;
@@ -875,6 +1000,7 @@ impl Engine {
             ]);
             let df_t = sd.n as f64 - 1.0;
             let t = sd.mean / sd.sem;
+            let margin = t_crit(0.05, df_t) * sd.sem;
             test.rows.push(vec![
                 text(format!("{} - {}", self.display(a), self.display(b))),
                 num(sd.mean),
@@ -883,6 +1009,9 @@ impl Engine {
                 num(t),
                 num(df_t),
                 num(t_sig_2tailed(t, df_t)),
+                num(sd.mean / sd.sd),
+                num(sd.mean - margin),
+                num(sd.mean + margin),
             ]);
         }
         Ok(Analysis {
@@ -966,6 +1095,15 @@ impl Engine {
             ]);
             tables.push(t);
 
+            // Effect size (Measures of Association): η and η².
+            let eta_sq = if ss_total > 0.0 { ss_between / ss_total } else { f64::NAN };
+            let mut assoc = OutTable::new(
+                format!("Measures of Association — {}", self.display(v)),
+                vec!["Eta", "Eta Squared"],
+            );
+            assoc.rows.push(vec![num(eta_sq.sqrt()), num(eta_sq)]);
+            tables.push(assoc);
+
             if !posthoc.eq_ignore_ascii_case("none") {
                 tables.push(self.posthoc_table(
                     &self.display(v),
@@ -983,8 +1121,8 @@ impl Engine {
         })
     }
 
-    /// Post-hoc pairwise comparisons (LSD or Bonferroni) using the pooled
-    /// within-groups variance — both rest on the t distribution.
+    /// Post-hoc pairwise comparisons (LSD, Bonferroni, or Tukey HSD) using the
+    /// pooled within-groups variance.
     fn posthoc_table(
         &self,
         dep: &str,
@@ -995,7 +1133,14 @@ impl Engine {
         method: &str,
     ) -> SResult<OutTable> {
         let bonferroni = method.eq_ignore_ascii_case("bonferroni");
-        let method_label = if bonferroni { "Bonferroni" } else { "LSD" };
+        let tukey = method.eq_ignore_ascii_case("tukey");
+        let method_label = if tukey {
+            "Tukey HSD"
+        } else if bonferroni {
+            "Bonferroni"
+        } else {
+            "LSD"
+        };
         let means: Vec<f64> = groups
             .iter()
             .map(|g| g.iter().sum::<f64>() / g.len() as f64)
@@ -1022,11 +1167,18 @@ impl Engine {
                 let nj = groups[j].len() as f64;
                 let diff = means[i] - means[j];
                 let se = (ms_within * (1.0 / ni + 1.0 / nj)).sqrt();
-                let tstat = diff / se;
-                let mut p = t_sig_2tailed(tstat, df_within);
-                if bonferroni {
-                    p = (p * n_comparisons).min(1.0);
-                }
+                let p = if tukey {
+                    // Tukey-Kramer: q = |diff| / √(MSE/2·(1/nᵢ+1/nⱼ)).
+                    let q = diff.abs() / (ms_within * 0.5 * (1.0 / ni + 1.0 / nj)).sqrt();
+                    tukey_sig(q, k as f64, df_within)
+                } else {
+                    let p = t_sig_2tailed(diff / se, df_within);
+                    if bonferroni {
+                        (p * n_comparisons).min(1.0)
+                    } else {
+                        p
+                    }
+                };
                 t.rows.push(vec![
                     text(&levels[i]),
                     text(&levels[j]),
@@ -1231,10 +1383,20 @@ impl Engine {
             JsonValue::Null,
         ]);
 
-        // Coefficients.
+        // Coefficients (with 95% confidence intervals for B).
+        let tc = t_crit(0.05, df_res);
         let mut coef = OutTable::new(
             "Coefficients",
-            vec!["", "B", "Std. Error", "Beta", "t", "Sig."],
+            vec![
+                "",
+                "B",
+                "Std. Error",
+                "Beta",
+                "t",
+                "Sig.",
+                "95% CI Lower",
+                "95% CI Upper",
+            ],
         );
         for a in 0..k {
             let se = (mse * inv[a][a]).sqrt();
@@ -1257,6 +1419,8 @@ impl Engine {
                 beta_std,
                 num(tstat),
                 num(sig),
+                num(beta[a] - tc * se),
+                num(beta[a] + tc * se),
             ]);
         }
 
@@ -1769,6 +1933,303 @@ impl Engine {
         t
     }
 
+    // ── Reliability (Cronbach's alpha) ────────────────────────────────────────
+
+    fn reliability(&self, df: &DataFrame, vars: &[String]) -> SResult<Analysis> {
+        let k = vars.len();
+        if k < 2 {
+            return Err("Reliability analysis needs at least 2 items".into());
+        }
+        // Listwise-deleted item matrix.
+        let cols: Vec<Vec<Option<f64>>> =
+            vars.iter().map(|v| col_opt(df, v)).collect::<SResult<_>>()?;
+        let nrows = df.height();
+        let mut rows: Vec<Vec<f64>> = Vec::new();
+        for i in 0..nrows {
+            if cols.iter().all(|c| c[i].is_some()) {
+                rows.push(cols.iter().map(|c| c[i].unwrap()).collect());
+            }
+        }
+        let n = rows.len();
+        if n < 2 {
+            return Err("Not enough complete cases for reliability".into());
+        }
+
+        let item = |j: usize| -> Vec<f64> { rows.iter().map(|r| r[j]).collect() };
+        let total: Vec<f64> = rows.iter().map(|r| r.iter().sum()).collect();
+        let var_total = describe(&total).variance;
+        let sum_item_var: f64 = (0..k).map(|j| describe(&item(j)).variance).sum();
+        let kf = k as f64;
+        let alpha = (kf / (kf - 1.0)) * (1.0 - sum_item_var / var_total);
+
+        // Standardized alpha from the mean inter-item correlation.
+        let mut r_sum = 0.0;
+        let mut r_cnt = 0.0;
+        for a in 0..k {
+            for b in (a + 1)..k {
+                r_sum += pearson(&item(a), &item(b));
+                r_cnt += 1.0;
+            }
+        }
+        let mean_r = r_sum / r_cnt;
+        let std_alpha = (kf * mean_r) / (1.0 + (kf - 1.0) * mean_r);
+
+        let mut rel = OutTable::new(
+            "Reliability Statistics",
+            vec!["Cronbach's Alpha", "Cronbach's Alpha (Standardized)", "N of Items"],
+        );
+        rel.rows.push(vec![num(alpha), num(std_alpha), int(k as i64)]);
+
+        // Item-Total Statistics.
+        let mut it = OutTable::new(
+            "Item-Total Statistics",
+            vec![
+                "",
+                "Scale Mean if Item Deleted",
+                "Scale Variance if Item Deleted",
+                "Corrected Item-Total Correlation",
+                "Cronbach's Alpha if Item Deleted",
+            ],
+        );
+        let grand_mean = describe(&total).mean;
+        for j in 0..k {
+            let item_j = item(j);
+            let item_mean = describe(&item_j).mean;
+            // Scale score with item j removed (sum of the other items per case).
+            let rest_total: Vec<f64> = (0..n).map(|i| total[i] - rows[i][j]).collect();
+            let scale_mean = grand_mean - item_mean;
+            let scale_var = describe(&rest_total).variance;
+            let corrected = pearson(&item_j, &rest_total);
+
+            // Alpha with item j removed.
+            let k2 = (k - 1) as f64;
+            let sum_var2 = sum_item_var - describe(&item_j).variance;
+            let alpha2 = (k2 / (k2 - 1.0)) * (1.0 - sum_var2 / scale_var);
+
+            it.rows.push(vec![
+                text(self.display(&vars[j])),
+                num(scale_mean),
+                num(scale_var),
+                num(corrected),
+                num(alpha2),
+            ]);
+        }
+
+        Ok(Analysis {
+            title: "Reliability Analysis".into(),
+            tables: vec![rel, it],
+        })
+    }
+
+    // ── GLM Univariate (factorial ANOVA / ANCOVA, Type III SS) ────────────────
+
+    fn glm_univariate(
+        &self,
+        df: &DataFrame,
+        dependent: &str,
+        factors: &[String],
+        covariates: &[String],
+    ) -> SResult<Analysis> {
+        if factors.is_empty() && covariates.is_empty() {
+            return Err("Specify at least one factor or covariate".into());
+        }
+        // Listwise deletion across dependent, factors, and covariates.
+        let y_all = col_opt(df, dependent)?;
+        let cov_all: Vec<Vec<Option<f64>>> =
+            covariates.iter().map(|c| col_opt(df, c)).collect::<SResult<_>>()?;
+        let fac_all: Vec<Vec<Option<String>>> =
+            factors.iter().map(|f| col_labels(df, f)).collect::<SResult<_>>()?;
+        let nrows = df.height();
+
+        let mut y = Vec::new();
+        let mut keep = Vec::new();
+        for i in 0..nrows {
+            let ok = y_all[i].is_some()
+                && cov_all.iter().all(|c| c[i].is_some())
+                && fac_all.iter().all(|f| f[i].is_some());
+            if ok {
+                y.push(y_all[i].unwrap());
+                keep.push(i);
+            }
+        }
+        let n = y.len();
+        if n < 3 {
+            return Err("Not enough complete cases".into());
+        }
+
+        // Factor levels (reference = first level, dropped).
+        let levels: Vec<Vec<String>> = factors
+            .iter()
+            .enumerate()
+            .map(|(fi, _)| {
+                let mut lv: Vec<String> =
+                    keep.iter().map(|&i| fac_all[fi][i].clone().unwrap()).collect();
+                lv.sort();
+                lv.dedup();
+                lv
+            })
+            .collect();
+
+        // Build effects, each as a set of column vectors (length n).
+        let mut effects: Vec<Effect> = Vec::new();
+
+        // Covariates: one continuous column each.
+        for (ci, cov) in covariates.iter().enumerate() {
+            let col: Vec<f64> = keep.iter().map(|&i| cov_all[ci][i].unwrap()).collect();
+            effects.push(Effect { name: self.display(cov), cols: vec![col] });
+        }
+
+        // Factor main effects + all interactions (full factorial), via dummy
+        // (reference) coding. An interaction's columns are the elementwise
+        // products of the involved factors' dummy columns.
+        let dummies: Vec<Vec<Vec<f64>>> = factors
+            .iter()
+            .enumerate()
+            .map(|(fi, _)| {
+                levels[fi]
+                    .iter()
+                    .skip(1)
+                    .map(|lev| {
+                        keep.iter()
+                            .map(|&i| if fac_all[fi][i].as_deref() == Some(lev) { 1.0 } else { 0.0 })
+                            .collect::<Vec<f64>>()
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let nf = factors.len();
+        for mask in 1u32..(1u32 << nf) {
+            let involved: Vec<usize> = (0..nf).filter(|&b| mask & (1 << b) != 0).collect();
+            // Name e.g. "A * B".
+            let name = involved
+                .iter()
+                .map(|&b| self.display(&factors[b]))
+                .collect::<Vec<_>>()
+                .join(" * ");
+            // Cartesian product of the involved factors' dummy columns.
+            let mut cols: Vec<Vec<f64>> = vec![vec![1.0; n]];
+            for &b in &involved {
+                let mut next = Vec::new();
+                for existing in &cols {
+                    for dcol in &dummies[b] {
+                        next.push((0..n).map(|i| existing[i] * dcol[i]).collect());
+                    }
+                }
+                cols = next;
+            }
+            effects.push(Effect { name, cols });
+        }
+
+        // Full design = intercept + every effect's columns.
+        let intercept = vec![1.0; n];
+        let full: Vec<&Vec<f64>> = std::iter::once(&intercept)
+            .chain(effects.iter().flat_map(|e| e.cols.iter()))
+            .collect();
+        let sse_full = ols_sse(&full, &y).ok_or("Design matrix is singular (collinear effects)")?;
+        let total_cols: usize = effects.iter().map(|e| e.cols.len()).sum();
+        let df_error = (n - 1 - total_cols) as f64;
+        if df_error <= 0.0 {
+            return Err("Too many parameters for the number of cases".into());
+        }
+        let mse = sse_full / df_error;
+
+        let ybar = y.iter().sum::<f64>() / n as f64;
+        let ss_total_corr: f64 = y.iter().map(|v| (v - ybar).powi(2)).sum();
+        let ss_total_unc: f64 = y.iter().map(|v| v * v).sum();
+        let ss_model = ss_total_corr - sse_full;
+        let df_model = total_cols as f64;
+
+        let mut t = OutTable::new(
+            format!("Tests of Between-Subjects Effects — {}", self.display(dependent)),
+            vec![
+                "Source",
+                "Type III Sum of Squares",
+                "df",
+                "Mean Square",
+                "F",
+                "Sig.",
+                "Partial Eta Squared",
+            ],
+        );
+        let eff_row = |name: &str, ss: f64, dfx: f64| -> Vec<JsonValue> {
+            let ms = ss / dfx;
+            let f = ms / mse;
+            let partial = ss / (ss + sse_full);
+            vec![
+                text(name),
+                num(ss),
+                num(dfx),
+                num(ms),
+                num(f),
+                num(f_sig(f, dfx, df_error)),
+                num(partial),
+            ]
+        };
+
+        t.rows.push(eff_row("Corrected Model", ss_model, df_model));
+
+        // Intercept effect: drop the intercept column only.
+        let no_intercept: Vec<&Vec<f64>> = effects.iter().flat_map(|e| e.cols.iter()).collect();
+        if let Some(sse_ni) = ols_sse(&no_intercept, &y) {
+            t.rows.push(eff_row("Intercept", sse_ni - sse_full, 1.0));
+        }
+
+        // Each effect: Type III SS = SSE(without its columns) − SSE(full).
+        for (ei, e) in effects.iter().enumerate() {
+            let reduced: Vec<&Vec<f64>> = std::iter::once(&intercept)
+                .chain(
+                    effects
+                        .iter()
+                        .enumerate()
+                        .filter(|(j, _)| *j != ei)
+                        .flat_map(|(_, oe)| oe.cols.iter()),
+                )
+                .collect();
+            let ss = match ols_sse(&reduced, &y) {
+                Some(sse_r) => sse_r - sse_full,
+                None => f64::NAN,
+            };
+            t.rows.push(eff_row(&e.name, ss, e.cols.len() as f64));
+        }
+
+        t.rows.push(vec![
+            text("Error"),
+            num(sse_full),
+            num(df_error),
+            num(mse),
+            JsonValue::Null,
+            JsonValue::Null,
+            JsonValue::Null,
+        ]);
+        t.rows.push(vec![
+            text("Total"),
+            num(ss_total_unc),
+            num(n as f64),
+            JsonValue::Null,
+            JsonValue::Null,
+            JsonValue::Null,
+            JsonValue::Null,
+        ]);
+        t.rows.push(vec![
+            text("Corrected Total"),
+            num(ss_total_corr),
+            num(n as f64 - 1.0),
+            JsonValue::Null,
+            JsonValue::Null,
+            JsonValue::Null,
+            JsonValue::Null,
+        ]);
+
+        let r2 = if ss_total_corr > 0.0 { ss_model / ss_total_corr } else { f64::NAN };
+        let t = t.footnote(format!("R Squared = {:.3} (Type III sums of squares).", r2));
+
+        Ok(Analysis {
+            title: "GLM Univariate".into(),
+            tables: vec![t],
+        })
+    }
+
     // ── Charts ────────────────────────────────────────────────────────────────
 
     /// Compute chart data for the Graphs menu. Aggregation happens here so the
@@ -1786,6 +2247,10 @@ impl Engine {
                 &p_strs(params, "vars")?,
                 p_str_opt(params, "group").as_deref(),
             ),
+            "line" => self.chart_line(df, &p_strs(params, "vars")?),
+            "clustered_bar" => {
+                self.chart_clustered_bar(df, &p_str(params, "var")?, &p_str(params, "cluster")?)
+            }
             other => Err(format!("Unknown chart: {other}")),
         }
     }
@@ -1952,6 +2417,76 @@ impl Engine {
             x_label: String::new(),
             y_label: "Value".into(),
             payload: serde_json::json!({ "boxes": boxes }),
+        })
+    }
+
+    fn chart_line(&self, df: &DataFrame, vars: &[String]) -> SResult<ChartData> {
+        // One series per variable, plotted against case order (sampled if large).
+        const CAP: usize = 3000;
+        let mut series = Vec::new();
+        for v in vars {
+            let xs = col_opt(df, v)?;
+            let stride = (xs.len() / CAP).max(1);
+            let points: Vec<JsonValue> = (0..xs.len())
+                .step_by(stride)
+                .filter_map(|i| xs[i].map(|y| serde_json::json!([i as f64 + 1.0, y])))
+                .collect();
+            series.push(serde_json::json!({ "label": self.display(v), "points": points }));
+        }
+        if series.is_empty() {
+            return Err("Select at least one variable".into());
+        }
+        Ok(ChartData {
+            title: if vars.len() == 1 {
+                format!("Line Chart of {}", self.display(&vars[0]))
+            } else {
+                "Line Chart".into()
+            },
+            kind: "line".into(),
+            x_label: "Case".into(),
+            y_label: "Value".into(),
+            payload: serde_json::json!({ "series": series }),
+        })
+    }
+
+    fn chart_clustered_bar(&self, df: &DataFrame, var: &str, cluster: &str) -> SResult<ChartData> {
+        // Counts for each (category × cluster) cell; categories on the X axis,
+        // clusters as colour-coded series.
+        let cat_labels = col_labels(df, var)?;
+        let clus_labels = col_labels(df, cluster)?;
+        let cat_vl = self.var_meta.get(var).and_then(|m| m.value_labels.clone());
+        let clus_vl = self.var_meta.get(cluster).and_then(|m| m.value_labels.clone());
+        let cats = ordered_levels(&cat_labels);
+        let clusters = ordered_levels(&clus_labels);
+        if cats.is_empty() || clusters.is_empty() {
+            return Err("Both variables need at least one category".into());
+        }
+        let mut counts = vec![vec![0i64; clusters.len()]; cats.len()];
+        for i in 0..cat_labels.len() {
+            if let (Some(c), Some(g)) = (&cat_labels[i], &clus_labels[i]) {
+                let ci = cats.iter().position(|x| x == c).unwrap();
+                let gi = clusters.iter().position(|x| x == g).unwrap();
+                counts[ci][gi] += 1;
+            }
+        }
+        let label_for = |raw: &str, vl: &Option<std::collections::HashMap<String, String>>| {
+            vl.as_ref().and_then(|m| m.get(raw).cloned()).unwrap_or_else(|| raw.to_string())
+        };
+        let categories: Vec<JsonValue> = cats.iter().map(|c| text(label_for(c, &cat_vl))).collect();
+        let series: Vec<JsonValue> = clusters
+            .iter()
+            .enumerate()
+            .map(|(gi, g)| {
+                let vals: Vec<i64> = (0..cats.len()).map(|ci| counts[ci][gi]).collect();
+                serde_json::json!({ "label": label_for(g, &clus_vl), "counts": vals })
+            })
+            .collect();
+        Ok(ChartData {
+            title: format!("{} by {}", self.display(var), self.display(cluster)),
+            kind: "clustered_bar".into(),
+            x_label: self.display(var),
+            y_label: "Count".into(),
+            payload: serde_json::json!({ "categories": categories, "series": series }),
         })
     }
 }
@@ -2166,6 +2701,45 @@ fn pearson(a: &[f64], b: &[f64]) -> f64 {
         return f64::NAN;
     }
     cov / (va.sqrt() * vb.sqrt())
+}
+
+/// A named GLM effect carrying its own design columns (each length n).
+struct Effect {
+    name: String,
+    cols: Vec<Vec<f64>>,
+}
+
+/// OLS residual sum of squares for a design given as column vectors and a
+/// response `y`. Returns None if the normal-equations matrix is singular.
+fn ols_sse(columns: &[&Vec<f64>], y: &[f64]) -> Option<f64> {
+    let n = y.len();
+    let k = columns.len();
+    if k == 0 {
+        let ybar = y.iter().sum::<f64>() / n as f64;
+        return Some(y.iter().map(|v| (v - ybar).powi(2)).sum());
+    }
+    // Normal equations (XᵀX) β = Xᵀy.
+    let mut xtx = vec![vec![0.0; k]; k];
+    let mut xty = vec![0.0; k];
+    for i in 0..n {
+        for a in 0..k {
+            let xa = columns[a][i];
+            xty[a] += xa * y[i];
+            for b in 0..k {
+                xtx[a][b] += xa * columns[b][i];
+            }
+        }
+    }
+    let inv = invert(xtx)?;
+    let beta: Vec<f64> = (0..k)
+        .map(|a| (0..k).map(|b| inv[a][b] * xty[b]).sum())
+        .collect();
+    let mut sse = 0.0;
+    for i in 0..n {
+        let yhat: f64 = (0..k).map(|a| beta[a] * columns[a][i]).sum();
+        sse += (y[i] - yhat).powi(2);
+    }
+    Some(sse)
 }
 
 /// In-place Gauss-Jordan inversion; returns None if singular.
@@ -2435,6 +3009,54 @@ mod tests {
         close(b["q1"].as_f64().unwrap(), 3.0, 1e-9);
         close(b["median"].as_f64().unwrap(), 5.0, 1e-9);
         close(b["q3"].as_f64().unwrap(), 7.0, 1e-9);
+    }
+
+    #[test]
+    fn t_critical_values() {
+        // t_0.05,2-tailed for df=10 is 2.2281; df=∞-ish (1000) ≈ 1.962.
+        close(t_crit(0.05, 10.0), 2.22814, 1e-3);
+        close(t_crit(0.05, 1000.0), 1.9623, 2e-3);
+        // Round-trip: p of the critical value equals alpha.
+        close(t_sig_2tailed(t_crit(0.01, 25.0), 25.0), 0.01, 1e-4);
+    }
+
+    #[test]
+    fn ptukey_known() {
+        // q_0.05(3, 20) = 3.578 → ptukey ≈ 0.95.
+        close(ptukey(3.578, 3.0, 20.0), 0.95, 5e-3);
+        // q_0.05(4, 12) = 4.199 → ptukey ≈ 0.95.
+        close(ptukey(4.199, 4.0, 12.0), 0.95, 5e-3);
+    }
+
+    #[test]
+    fn reliability_and_glm_run() {
+        let df = df![
+            "i1" => [1.0, 2.0, 3.0, 4.0, 5.0, 2.0, 3.0, 4.0],
+            "i2" => [2.0, 2.0, 3.0, 5.0, 4.0, 1.0, 3.0, 5.0],
+            "i3" => [1.0, 3.0, 4.0, 4.0, 5.0, 2.0, 2.0, 4.0],
+            "g"  => [1i64, 1, 1, 1, 2, 2, 2, 2],
+            "y"  => [5.0, 6.0, 7.0, 8.0, 3.0, 4.0, 5.0, 6.0],
+        ]
+        .unwrap();
+        let mut eng = Engine::default();
+        eng.df = Some(df);
+        eng.run_analysis("reliability", &serde_json::json!({ "vars": ["i1", "i2", "i3"] }))
+            .unwrap();
+        let glm = eng
+            .run_analysis(
+                "glm_univariate",
+                &serde_json::json!({ "dependent": "y", "factors": ["g"], "covariates": ["i1"] }),
+            )
+            .unwrap();
+        assert!(!glm.tables[0].rows.is_empty());
+        eng.run_chart("line", &serde_json::json!({ "vars": ["y", "i1"] })).unwrap();
+        eng.run_chart("clustered_bar", &serde_json::json!({ "var": "g", "cluster": "i1" }))
+            .unwrap();
+        eng.run_analysis(
+            "anova_oneway",
+            &serde_json::json!({ "vars": ["y"], "factor": "g", "posthoc": "tukey" }),
+        )
+        .unwrap();
     }
 
     #[test]

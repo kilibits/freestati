@@ -215,7 +215,8 @@ const SPECS: Record<string, DialogSpec> = {
         <div class="dialog-options-label">Post Hoc Comparisons</div>
         <label><input type="radio" name="posthoc" value="none" checked /> None</label>
         <label><input type="radio" name="posthoc" value="lsd" /> LSD</label>
-        <label><input type="radio" name="posthoc" value="bonferroni" /> Bonferroni</label>`;
+        <label><input type="radio" name="posthoc" value="bonferroni" /> Bonferroni</label>
+        <label><input type="radio" name="posthoc" value="tukey" /> Tukey HSD</label>`;
       b.appendChild(fs);
     },
     collect: (m, b) => {
@@ -238,6 +239,34 @@ const SPECS: Record<string, DialogSpec> = {
       const col = m.values('col');
       if (row.length !== 1 || col.length !== 1) return 'Select one row and one column variable.';
       return { row: row[0], col: col[0] };
+    },
+  },
+  reliability: {
+    title: 'Reliability Analysis',
+    procedure: 'reliability',
+    slots: [{ key: 'vars', label: 'Items', multiple: true }],
+    collect: (m) => {
+      const vars = m.values('vars');
+      if (vars.length < 2) return 'Select at least two items.';
+      return { vars };
+    },
+  },
+  glm_univariate: {
+    title: 'Univariate (General Linear Model)',
+    procedure: 'glm_univariate',
+    slots: [
+      { key: 'dependent', label: 'Dependent Variable', multiple: false },
+      { key: 'factors', label: 'Fixed Factor(s)', multiple: true },
+      { key: 'covariates', label: 'Covariate(s)', multiple: true },
+    ],
+    collect: (m) => {
+      const dep = m.values('dependent');
+      if (dep.length !== 1) return 'Select exactly one dependent variable.';
+      const factors = m.values('factors');
+      const covariates = m.values('covariates');
+      if (factors.length === 0 && covariates.length === 0)
+        return 'Add at least one factor or covariate.';
+      return { dependent: dep[0], factors, covariates };
     },
   },
   factor: {
@@ -370,6 +399,30 @@ const CHART_SPECS: Record<string, ChartSpec> = {
     kind: 'bar',
     slots: [{ key: 'var', label: 'Category Axis', multiple: false }],
     collect: (m) => requireOne(m, 'var'),
+  },
+  clustered_bar: {
+    title: 'Clustered Bar Chart',
+    kind: 'clustered_bar',
+    slots: [
+      { key: 'var', label: 'Category Axis', multiple: false },
+      { key: 'cluster', label: 'Cluster By', multiple: false },
+    ],
+    collect: (m) => {
+      const v = m.values('var');
+      const cluster = m.values('cluster');
+      if (v.length !== 1 || cluster.length !== 1) return 'Select a category and a cluster variable.';
+      return { var: v[0], cluster: cluster[0] };
+    },
+  },
+  line: {
+    title: 'Line Chart',
+    kind: 'line',
+    slots: [{ key: 'vars', label: 'Variable(s)', multiple: true }],
+    collect: (m) => {
+      const vars = m.values('vars');
+      if (vars.length === 0) return 'Select at least one variable.';
+      return { vars };
+    },
   },
   scatter: {
     title: 'Scatter Plot',

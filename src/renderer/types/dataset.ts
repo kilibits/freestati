@@ -33,4 +33,6 @@ export interface DatasetState {
   colCount: number;
   variables: Variable[];
   modified: boolean;
+  /** Datasets open read-only; editing is enabled via the toolbar toggle. */
+  editMode: boolean;
 }

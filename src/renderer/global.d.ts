@@ -28,6 +28,8 @@ declare global {
       run(procedure: string, params: Record<string, unknown>): Promise<Analysis>;
       chart(kind: string, params: Record<string, unknown>): Promise<ChartData>;
       exportText(contents: string): Promise<string | null>;
+      exportSvg(contents: string): Promise<string | null>;
+      exportPng(bytes: number[]): Promise<string | null>;
     };
 
     fs: {

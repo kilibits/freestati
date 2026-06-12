@@ -171,6 +171,13 @@ fn save_text_file(path: String, contents: String) -> Result<JsonValue, String> {
     Ok(json!({ "ok": true, "path": path }))
 }
 
+/// Write raw bytes (e.g. a PNG rendered from a chart) to a chosen path.
+#[tauri::command]
+fn save_binary_file(path: String, bytes: Vec<u8>) -> Result<JsonValue, String> {
+    std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+    Ok(json!({ "ok": true, "path": path }))
+}
+
 // ── Native menu ─────────────────────────────────────────────────────────────
 
 fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
@@ -186,6 +193,7 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         .item(&mi("menu:file:new", "New Dataset", Some("CmdOrCtrl+N"))?)
         .separator()
         .item(&mi("menu:file:open", "Open…", Some("CmdOrCtrl+O"))?)
+        .item(&mi("menu:file:openFolder", "Open Folder…", Some("CmdOrCtrl+Shift+O"))?)
         .separator()
         .item(&mi("menu:file:save", "Save", Some("CmdOrCtrl+S"))?)
         .item(&mi("menu:file:saveAs", "Save As…", Some("CmdOrCtrl+Shift+S"))?)
@@ -219,15 +227,21 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         .item(&mi("menu:analyze:anova_oneway", "One-Way ANOVA…", None)?)
         .build()?;
 
+    let glm = SubmenuBuilder::new(app, "General Linear Model")
+        .item(&mi("menu:analyze:glm_univariate", "Univariate…", None)?)
+        .build()?;
+
     let analyze = SubmenuBuilder::new(app, "Analyze")
         .item(&mi("menu:analyze:frequencies", "Frequencies…", None)?)
         .item(&mi("menu:analyze:descriptives", "Descriptives…", None)?)
         .item(&mi("menu:analyze:crosstabs", "Crosstabs…", None)?)
         .separator()
         .item(&compare_means)
+        .item(&glm)
         .item(&mi("menu:analyze:correlate", "Correlate…", None)?)
         .item(&mi("menu:analyze:regression_linear", "Linear Regression…", None)?)
         .item(&mi("menu:analyze:factor", "Factor Analysis…", None)?)
+        .item(&mi("menu:analyze:reliability", "Reliability Analysis…", None)?)
         .item(&nonparametric)
         .build()?;
 
@@ -235,6 +249,8 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let graphs = SubmenuBuilder::new(app, "Graphs")
         .item(&mi("menu:graph:histogram", "Histogram…", None)?)
         .item(&mi("menu:graph:bar", "Bar Chart…", None)?)
+        .item(&mi("menu:graph:clustered_bar", "Clustered Bar Chart…", None)?)
+        .item(&mi("menu:graph:line", "Line Chart…", None)?)
         .item(&mi("menu:graph:scatter", "Scatter Plot…", None)?)
         .item(&mi("menu:graph:box", "Box Plot…", None)?)
         .build()?;
@@ -306,6 +322,7 @@ pub fn run() {
             run_analysis,
             run_chart,
             save_text_file,
+            save_binary_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running FreeStati");

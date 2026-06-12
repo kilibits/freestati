@@ -10,6 +10,7 @@ const DEFAULT: DatasetState = {
   colCount: 0,
   variables: [],
   modified: false,
+  editMode: false,
 };
 
 class DataStore {
@@ -38,7 +39,14 @@ class DataStore {
       colCount: result.colCount,
       variables: result.variables,
       modified: false,
+      editMode: false, // opened files start read-only
     };
+    this.notify();
+  }
+
+  setEditMode(editMode: boolean): void {
+    if (this.state.editMode === editMode) return;
+    this.state = { ...this.state, editMode };
     this.notify();
   }
 

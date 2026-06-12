@@ -73,10 +73,26 @@ export class OutputView {
   private renderChartBlock(chart: ChartData): HTMLElement {
     const block = document.createElement('div');
     block.className = 'output-block';
-    block.appendChild(heading(chart.title));
+
+    const head = document.createElement('div');
+    head.className = 'output-table-head';
+    const title = heading(chart.title);
+    title.classList.add('output-chart-title');
+    head.appendChild(title);
+
+    const svg = renderChart(chart);
+    const actions = document.createElement('span');
+    actions.className = 'output-table-actions';
+    actions.append(
+      miniButton('Save SVG', () => void saveSvg(svg)),
+      miniButton('Save PNG', () => void savePng(svg)),
+    );
+    head.appendChild(actions);
+    block.appendChild(head);
+
     const host = document.createElement('div');
     host.className = 'output-chart-host';
-    host.appendChild(renderChart(chart));
+    host.appendChild(svg);
     block.appendChild(host);
     return block;
   }
@@ -254,6 +270,56 @@ function formatCell(cell: string | number | null): string {
   if (Number.isInteger(cell)) return String(cell);
   const rounded = Number(cell.toFixed(3));
   return (Object.is(rounded, -0) ? 0 : rounded).toFixed(3);
+}
+
+/** Serialize an SVG element to a standalone document string. */
+function svgString(svg: SVGSVGElement): string {
+  const clone = svg.cloneNode(true) as SVGSVGElement;
+  clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+  // Paint a solid background so exported images aren't transparent.
+  const bg = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+  bg.setAttribute('width', '100%');
+  bg.setAttribute('height', '100%');
+  bg.setAttribute('fill', '#1a1d27');
+  clone.insertBefore(bg, clone.firstChild);
+  return new XMLSerializer().serializeToString(clone);
+}
+
+async function saveSvg(svg: SVGSVGElement): Promise<void> {
+  try {
+    await window.electron.analysis.exportSvg(svgString(svg));
+  } catch (err) {
+    alert(`Save SVG failed:\n${err}`);
+  }
+}
+
+/** Rasterize the SVG to a PNG via an offscreen canvas, then write the bytes. */
+async function savePng(svg: SVGSVGElement): Promise<void> {
+  try {
+    const scale = 2; // export at 2× for crispness
+    const w = svg.viewBox.baseVal.width || svg.clientWidth || 560;
+    const h = svg.viewBox.baseVal.height || svg.clientHeight || 360;
+    const url = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svgString(svg))}`;
+    const img = new Image();
+    await new Promise<void>((resolve, reject) => {
+      img.onload = () => resolve();
+      img.onerror = () => reject(new Error('Could not rasterize chart'));
+      img.src = url;
+    });
+    const canvas = document.createElement('canvas');
+    canvas.width = w * scale;
+    canvas.height = h * scale;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) throw new Error('Canvas unavailable');
+    ctx.scale(scale, scale);
+    ctx.drawImage(img, 0, 0);
+    const blob = await new Promise<Blob | null>((res) => canvas.toBlob(res, 'image/png'));
+    if (!blob) throw new Error('PNG encoding failed');
+    const bytes = Array.from(new Uint8Array(await blob.arrayBuffer()));
+    await window.electron.analysis.exportPng(bytes);
+  } catch (err) {
+    alert(`Save PNG failed:\n${err}`);
+  }
 }
 
 /** Copy text to the clipboard, falling back to execCommand in older WebViews. */
