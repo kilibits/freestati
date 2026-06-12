@@ -43,9 +43,17 @@ export class DataView {
         <span class="search-icon">🔍</span>
         <input type="text" class="search-input" placeholder="Search in all columns..." />
       </div>
+      <select class="column-filter" style="margin-left: 8px; padding: 4px;">
+        <option value="">All Columns</option>
+      </select>
     `;
     const input = toolbar.querySelector('input')!;
     input.addEventListener('input', (e) => this.onSearchInput(e));
+    
+    const select = toolbar.querySelector('select')!;
+    select.addEventListener('change', () => {
+        this.onSearchInput({ target: input } as any);
+    });
     this.container.appendChild(toolbar);
 
     // ── Grid Container ───────────────────────────────────────────────────────
@@ -207,13 +215,14 @@ export class DataView {
   }
 
   private buildDatasource(rowCount: number): IDatasource {
+    const colFilter = (this.container.querySelector('.column-filter') as HTMLSelectElement)?.value;
     return {
       rowCount,
       getRows: (params: IGetRowsParams) => {
         const offset = params.startRow;
         const limit = params.endRow - params.startRow;
         window.electron.data
-          .getPage(offset, limit, this.searchQuery)
+          .getPage(offset, limit, this.searchQuery, colFilter || undefined)
           .then(({ rows, total }: { rows: Record<string, unknown>[]; total: number }) => {
             params.successCallback(rows, total);
           })

@@ -3253,6 +3253,7 @@ impl Engine {
             return Err(format!("'{var}' has too few valid values"));
         }
         let d = describe(&x);
+        let value_labels = self.var_meta.get(var).and_then(|m| m.value_labels.clone());
         let (min, max) = (d.min, d.max);
         // Sturges' rule, clamped to a sensible range.
         let bin_count = ((x.len() as f64).log2().ceil() as usize + 1).clamp(5, 40);
@@ -3282,7 +3283,11 @@ impl Engine {
             x_label: self.display(var),
             y_label: "Frequency".into(),
             payload: serde_json::json!({
-                "bins": bins, "mean": num(d.mean), "sd": num(d.sd), "n": d.n,
+                "bins": bins, 
+                "mean": num(d.mean), 
+                "sd": num(d.sd), 
+                "n": d.n,
+                "valueLabels": value_labels,
             }),
         })
     }

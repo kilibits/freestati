@@ -64,6 +64,7 @@ function drawHistogram(svg: SVGSVGElement, chart: ChartData): void {
   const maxCount = Math.max(...bins.map((b) => b.count), 1);
   const xMin = bins[0]!.x0;
   const xMax = bins[bins.length - 1]!.x1;
+  const valueLabels = chart.payload['valueLabels'] as Record<string, string> | undefined;
 
   axes(svg, chart, xMin, xMax, 0, maxCount);
   const sx = (v: number) => M.left + ((v - xMin) / (xMax - xMin || 1)) * PLOT_W;
@@ -83,6 +84,21 @@ function drawHistogram(svg: SVGSVGElement, chart: ChartData): void {
         stroke: COLORS.accent,
       }),
     );
+    
+    // Attempt to show a label if the bin midpoint matches a defined value label.
+    if (valueLabels) {
+      const mid = (b.x0 + b.x1) / 2;
+      const label = valueLabels[String(mid)];
+      if (label) {
+        svg.appendChild(
+          text(x + w / 2, M.top + PLOT_H + 16, truncate(label, 10), {
+            'text-anchor': 'middle',
+            fill: COLORS.muted,
+            'font-size': '10',
+          }),
+        );
+      }
+    }
   });
 }
 

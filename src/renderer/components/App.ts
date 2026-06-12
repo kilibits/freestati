@@ -1,4 +1,5 @@
 import { dataStore } from '../stores/dataStore';
+import { outputStore } from '../stores/outputStore';
 import { DataView } from './DataView';
 import { FileExplorer } from './FileExplorer';
 import { OutputView } from './OutputView';
@@ -134,6 +135,83 @@ export class App {
     // Reflect edit-mode state on the toggle button.
     dataStore.subscribe(() => this.refreshEditToggle());
     this.refreshEditToggle();
+
+    this.renderAnalyzeToolbar();
+  }
+
+  private renderAnalyzeToolbar(): void {
+    const toolbar = document.getElementById('analyze-toolbar');
+    if (!toolbar) return;
+
+    const showOutput = () => {
+      this.switchView('output');
+      this.outputView.scrollToBottom();
+    };
+
+    const categories = [
+      { name: 'Statistics', procs: ['frequencies', 'descriptives', 'correlate', 'regression_linear', 'crosstabs'] },
+      { name: 'Compare Means', procs: ['ttest_one_sample', 'ttest_independent', 'ttest_paired', 'anova_oneway'] },
+      { name: 'Advanced Models', procs: ['glm_univariate', 'glm_multivariate', 'glm_repeated', 'mixed_model', 'factor', 'reliability', 'survival_km', 'cox_regression'] },
+      { name: 'Nonparametric', procs: ['mann_whitney', 'wilcoxon', 'kruskal_wallis', 'chi_square'] }
+    ];
+
+    const dropdowns: HTMLSelectElement[] = [];
+
+    categories.forEach(cat => {
+      const dropdown = document.createElement('select');
+      dropdown.className = 'toolbar-btn';
+      dropdown.innerHTML = `<option value="">${cat.name} ▾</option>`;
+      cat.procs.forEach(proc => {
+        const option = document.createElement('option');
+        option.value = proc;
+        option.textContent = proc.replace('_', ' ');
+        dropdown.appendChild(option);
+      });
+      dropdown.addEventListener('change', () => {
+        if (!dataStore.get().loaded) {
+            dropdown.value = "";
+            return;
+        }
+        if(dropdown.value) openProcedureDialog(dropdown.value, showOutput);
+        dropdown.value = "";
+      });
+      toolbar.appendChild(dropdown);
+      dropdowns.push(dropdown);
+    });
+
+    const graphDropdown = document.createElement('select');
+    graphDropdown.className = 'toolbar-btn';
+    graphDropdown.innerHTML = `<option value="">Graphs ▾</option>`;
+    GRAPH_KINDS.forEach(kind => {
+      const option = document.createElement('option');
+      option.value = kind;
+      option.textContent = kind.replace('_', ' ');
+      graphDropdown.appendChild(option);
+    });
+    graphDropdown.addEventListener('change', () => {
+      if (!dataStore.get().loaded) {
+          graphDropdown.value = "";
+          return;
+      }
+      if(graphDropdown.value) openChartDialog(graphDropdown.value, showOutput);
+      graphDropdown.value = "";
+    });
+    toolbar.appendChild(graphDropdown);
+    dropdowns.push(graphDropdown);
+
+    const updateDisabledState = () => {
+      const { loaded } = dataStore.get();
+      dropdowns.forEach(d => {
+        d.style.opacity = loaded ? '1' : '0.45';
+        d.style.cursor = loaded ? 'pointer' : 'help';
+        d.title = loaded ? '' : 'Open a dataset to enable analysis tools';
+        // Note: we can't fully disable without losing the tooltip, 
+        // so we prevent action in the event listener instead.
+      });
+    };
+
+    dataStore.subscribe(updateDisabledState);
+    updateDisabledState();
   }
 
   private refreshEditToggle(): void {
@@ -221,8 +299,9 @@ export class App {
       >('load_file', { path: filePath });
       if (result.error) { alert(`Failed to open file:\n${result.error}`); return; }
       dataStore.applyLoadResult(result);
+      outputStore.clear();
       this.switchView('data');
-    } catch (err) {
+      } catch (err) {
       alert(`Failed to open file:\n${err}`);
     } finally {
       this.hideLoading();

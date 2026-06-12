@@ -110,8 +110,9 @@ fn get_page(
     offset: usize,
     limit: usize,
     query: Option<String>,
+    filter_col: Option<String>,
 ) -> Result<PageResult, String> {
-    state.lock().unwrap().get_page(offset, limit, query)
+    state.lock().unwrap().get_page(offset, limit, query, filter_col)
 }
 
 #[tauri::command]

@@ -57,12 +57,18 @@ html, body, #app {
   height: var(--toolbar-h);
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 4px;
   padding: 0 10px;
   background: var(--surface2);
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
   -webkit-app-region: no-drag;
+}
+.toolbar-group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
 }
 .toolbar-sep {
   width: 1px;
@@ -83,9 +89,18 @@ html, body, #app {
   transition: background 0.12s, border-color 0.12s;
   white-space: nowrap;
 }
-.toolbar-btn:hover:not(:disabled) { background: var(--accent); border-color: var(--accent); }
-.toolbar-btn.active  { background: var(--accent); border-color: var(--accent); }
+.toolbar-btn:hover:not(:disabled) { background: var(--surface2); border-color: var(--border); }
+.toolbar-btn.active  { background: var(--accent); color: white; border-color: var(--accent); }
 .toolbar-btn:disabled { opacity: 0.45; cursor: default; }
+
+select.toolbar-btn {
+  padding-right: 20px;
+  appearance: none;
+  background-image: url("data:image/svg+xml;charset=utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2394a3b8' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 4px center;
+  background-size: 12px;
+}
 
 /* ── Layout (sidebar + content) ───────────────────────────────────────────── */
 .layout {
@@ -230,6 +245,32 @@ html, body, #app {
   flex: 1;
   height: 100%;
   width: 100%;
+  display: flex;
+  flex-direction: row;
+}
+
+#variable-grid {
+  flex: 1;
+  height: 100%;
+}
+
+#variable-detail {
+  width: 300px;
+  border-left: 1px solid var(--border);
+  background: var(--surface);
+  padding: 16px;
+  font-size: 12px;
+  overflow-y: auto;
+  color: var(--text);
+}
+.variable-detail-title {
+  font-weight: bold;
+  margin-bottom: 8px;
+  color: var(--text-muted);
+}
+.variable-detail-content {
+  white-space: pre-wrap;
+  word-break: break-all;
 }
 
 /* ── Tab bar ──────────────────────────────────────────────────────────────── */
