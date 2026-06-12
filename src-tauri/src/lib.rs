@@ -58,7 +58,7 @@ fn open_external(url: String) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn read_dir(path: String) -> Result<Vec<DirEntry>, String> {
     let mut entries: Vec<DirEntry> = std::fs::read_dir(&path)
         .map_err(|e| e.to_string())?
@@ -94,7 +94,7 @@ fn read_dir(path: String) -> Result<Vec<DirEntry>, String> {
 
 // ── Dataset commands (named to match the renderer's IPC channels) ───────────
 
-#[tauri::command]
+#[tauri::command(async)]
 fn load_file(state: State<EngineState>, path: String) -> Result<LoadResult, String> {
     state.lock().unwrap().load_file(&path)
 }
@@ -104,7 +104,7 @@ fn new_dataset(state: State<EngineState>) -> LoadResult {
     state.lock().unwrap().new_dataset()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_page(
     state: State<EngineState>,
     offset: usize,
@@ -138,7 +138,7 @@ fn update_cell(
     Ok(json!({ "ok": true }))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn save_file(state: State<EngineState>, path: String) -> Result<JsonValue, String> {
     state.lock().unwrap().save_file(&path)?;
     Ok(json!({ "ok": true, "path": path }))
@@ -146,7 +146,7 @@ fn save_file(state: State<EngineState>, path: String) -> Result<JsonValue, Strin
 
 // ── Statistical procedures ──────────────────────────────────────────────────
 
-#[tauri::command]
+#[tauri::command(async)]
 fn run_analysis(
     state: State<EngineState>,
     procedure: String,
@@ -155,7 +155,7 @@ fn run_analysis(
     state.lock().unwrap().run_analysis(&procedure, &params)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn run_chart(
     state: State<EngineState>,
     kind: String,
@@ -165,17 +165,23 @@ fn run_chart(
 }
 
 /// Write text (e.g. exported output HTML) to a path chosen via the save dialog.
-#[tauri::command]
+#[tauri::command(async)]
 fn save_text_file(path: String, contents: String) -> Result<JsonValue, String> {
     std::fs::write(&path, contents).map_err(|e| e.to_string())?;
     Ok(json!({ "ok": true, "path": path }))
 }
 
 /// Write raw bytes (e.g. a PNG rendered from a chart) to a chosen path.
-#[tauri::command]
+#[tauri::command(async)]
 fn save_binary_file(path: String, bytes: Vec<u8>) -> Result<JsonValue, String> {
     std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
     Ok(json!({ "ok": true, "path": path }))
+}
+
+/// Read a UTF-8 text file (e.g. a saved syntax script).
+#[tauri::command(async)]
+fn read_text_file(path: String) -> Result<String, String> {
+    std::fs::read_to_string(&path).map_err(|e| e.to_string())
 }
 
 // ── Native menu ─────────────────────────────────────────────────────────────
@@ -229,6 +235,17 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
 
     let glm = SubmenuBuilder::new(app, "General Linear Model")
         .item(&mi("menu:analyze:glm_univariate", "Univariate…", None)?)
+        .item(&mi("menu:analyze:glm_multivariate", "Multivariate (MANOVA)…", None)?)
+        .item(&mi("menu:analyze:glm_repeated", "Repeated Measures…", None)?)
+        .build()?;
+
+    let mixed = SubmenuBuilder::new(app, "Mixed Models")
+        .item(&mi("menu:analyze:mixed_model", "Linear (random intercept)…", None)?)
+        .build()?;
+
+    let survival = SubmenuBuilder::new(app, "Survival")
+        .item(&mi("menu:analyze:survival_km", "Kaplan-Meier…", None)?)
+        .item(&mi("menu:analyze:cox_regression", "Cox Regression…", None)?)
         .build()?;
 
     let analyze = SubmenuBuilder::new(app, "Analyze")
@@ -238,10 +255,12 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         .separator()
         .item(&compare_means)
         .item(&glm)
+        .item(&mixed)
         .item(&mi("menu:analyze:correlate", "Correlate…", None)?)
         .item(&mi("menu:analyze:regression_linear", "Linear Regression…", None)?)
         .item(&mi("menu:analyze:factor", "Factor Analysis…", None)?)
         .item(&mi("menu:analyze:reliability", "Reliability Analysis…", None)?)
+        .item(&survival)
         .item(&nonparametric)
         .build()?;
 
@@ -261,6 +280,8 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         .separator()
         .item(&mi("menu:view:dataView", "Data View", Some("CmdOrCtrl+D"))?)
         .item(&mi("menu:view:variableView", "Variable View", Some("CmdOrCtrl+Shift+D"))?)
+        .item(&mi("menu:view:output", "Output", Some("CmdOrCtrl+Shift+U"))?)
+        .item(&mi("menu:view:syntax", "Syntax", Some("CmdOrCtrl+Shift+Y"))?)
         .separator()
         .item(&mi("menu:view:reload", "Reload", Some("CmdOrCtrl+R"))?)
         .item(&mi("menu:view:devtools", "Toggle Developer Tools", Some("CmdOrCtrl+Alt+I"))?)
@@ -323,6 +344,7 @@ pub fn run() {
             run_chart,
             save_text_file,
             save_binary_file,
+            read_text_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running FreeStati");

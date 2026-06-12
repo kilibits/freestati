@@ -21,10 +21,16 @@ export class OutputView {
     const toolbar = document.createElement('div');
     toolbar.className = 'view-toolbar output-toolbar';
     toolbar.innerHTML = `
-      <button class="output-btn" data-act="export">Export…</button>
+      <span class="output-toolbar-label">Export:</span>
+      <button class="output-btn" data-act="html">HTML</button>
+      <button class="output-btn" data-act="word">Word</button>
+      <button class="output-btn" data-act="pdf">PDF</button>
+      <span class="output-toolbar-sep"></span>
       <button class="output-btn" data-act="copyAll">Copy All</button>
       <button class="output-btn" data-act="clear">Clear Output</button>`;
-    toolbar.querySelector('[data-act="export"]')!.addEventListener('click', () => this.exportHtml());
+    toolbar.querySelector('[data-act="html"]')!.addEventListener('click', () => this.exportHtml());
+    toolbar.querySelector('[data-act="word"]')!.addEventListener('click', () => this.exportWord());
+    toolbar.querySelector('[data-act="pdf"]')!.addEventListener('click', () => this.exportPdf());
     toolbar.querySelector('[data-act="copyAll"]')!.addEventListener('click', () => this.copyAll());
     toolbar.querySelector('[data-act="clear"]')!.addEventListener('click', () => outputStore.clear());
     this.container.appendChild(toolbar);
@@ -117,9 +123,19 @@ export class OutputView {
     const pivotBtn = miniButton('Transpose', () => {
       transposed = !transposed;
       tableHost.replaceChildren(buildTable(table, transposed));
+      editBtn.classList.remove('active'); // rebuilt table is not editable
       pivotBtn.classList.toggle('active', transposed);
     });
-    actions.append(copyBtn, pivotBtn);
+    // Pivot editing: toggle contenteditable so labels/cells can be annotated.
+    let editing = false;
+    const editBtn = miniButton('Edit', () => {
+      editing = !editing;
+      const tbl = tableHost.querySelector('table');
+      if (tbl) tbl.contentEditable = editing ? 'true' : 'false';
+      tbl?.classList.toggle('editing', editing);
+      editBtn.classList.toggle('active', editing);
+    });
+    actions.append(copyBtn, pivotBtn, editBtn);
     head.appendChild(actions);
     wrap.appendChild(head);
 
@@ -138,16 +154,52 @@ export class OutputView {
   // ── Toolbar actions ──────────────────────────────────────────────────────────
 
   private async exportHtml(): Promise<void> {
+    await this.exportWith((html) => window.electron.analysis.exportText(html));
+  }
+
+  private async exportWord(): Promise<void> {
+    await this.exportWith((html) => window.electron.analysis.exportWord(html));
+  }
+
+  private async exportWith(save: (html: string) => Promise<string | null>): Promise<void> {
     if (outputStore.get().length === 0) {
       alert('No output to export.');
       return;
     }
     try {
-      const path = await window.electron.analysis.exportText(buildExportHtml(this.body));
+      const path = await save(buildExportHtml(this.body));
       if (path) alert(`Output exported to:\n${path}`);
     } catch (err) {
       alert(`Export failed:\n${err}`);
     }
+  }
+
+  /** Print the output via a hidden iframe so the user can "Save as PDF". */
+  private exportPdf(): void {
+    if (outputStore.get().length === 0) {
+      alert('No output to print.');
+      return;
+    }
+    const iframe = document.createElement('iframe');
+    iframe.style.position = 'fixed';
+    iframe.style.right = '0';
+    iframe.style.bottom = '0';
+    iframe.style.width = '0';
+    iframe.style.height = '0';
+    iframe.style.border = '0';
+    document.body.appendChild(iframe);
+    const doc = iframe.contentDocument;
+    if (!doc) {
+      iframe.remove();
+      return;
+    }
+    doc.open();
+    // The document auto-prints on load (forPrint=true), which waits for layout.
+    doc.write(buildExportHtml(this.body, /*forPrint*/ true));
+    doc.close();
+    iframe.contentWindow?.focus();
+    // Remove after the print dialog has had time to capture the document.
+    setTimeout(() => iframe.remove(), 3000);
   }
 
   private copyAll(): void {
@@ -248,18 +300,21 @@ function tableToTsv(table: OutTable, transposed: boolean): string {
   return lines.join('\n');
 }
 
-/** Build a standalone HTML document of the current output for export. */
-function buildExportHtml(body: HTMLElement): string {
+/** Build a standalone HTML document of the current output for export/print. */
+function buildExportHtml(body: HTMLElement, forPrint = false): string {
   const style = `
     body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:24px;color:#1a1a1a}
     h2{border-bottom:2px solid #6366f1;padding-bottom:4px;font-size:18px}
     table{border-collapse:collapse;margin:8px 0 18px;font-size:13px}
     th,td{border:1px solid #ccc;padding:4px 10px;text-align:right}
     th:first-child,td:first-child{text-align:left}
+    th{background:#eef}
     .output-footnote{font-size:11px;color:#666;font-style:italic;margin-bottom:16px}
     .output-table-actions{display:none}
+    .output-block{page-break-inside:avoid}
     svg{background:#fff}`;
-  return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>FreeStati Output</title><style>${style}</style></head><body>${body.innerHTML}</body></html>`;
+  const autoPrint = forPrint ? '<script>window.onload=function(){setTimeout(window.print,150)}<\/script>' : '';
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>FreeStati Output</title><style>${style}</style></head><body>${body.innerHTML}${autoPrint}</body></html>`;
 }
 
 /** Format a numeric cell SPSS-style: integers plain, others to 3 decimals. */

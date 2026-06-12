@@ -9,6 +9,8 @@
  */
 import { dataStore } from '../stores/dataStore';
 import { outputStore } from '../stores/outputStore';
+import { syntaxStore } from '../stores/syntaxStore';
+import { syntaxLine } from './syntax';
 import type { Analysis, ChartData } from '../types/analysis';
 import type { Variable } from '../types/dataset';
 
@@ -269,6 +271,90 @@ const SPECS: Record<string, DialogSpec> = {
       return { dependent: dep[0], factors, covariates };
     },
   },
+  glm_multivariate: {
+    title: 'Multivariate (MANOVA)',
+    procedure: 'glm_multivariate',
+    slots: [
+      { key: 'dependents', label: 'Dependent Variables', multiple: true },
+      { key: 'factor', label: 'Fixed Factor', multiple: false },
+    ],
+    collect: (m) => {
+      const dependents = m.values('dependents');
+      const factor = m.values('factor');
+      if (dependents.length < 2) return 'Select at least two dependent variables.';
+      if (factor.length !== 1) return 'Select one fixed factor.';
+      return { dependents, factor: factor[0] };
+    },
+  },
+  mixed_model: {
+    title: 'Linear Mixed Model (random intercept)',
+    procedure: 'mixed_model',
+    slots: [
+      { key: 'dependent', label: 'Dependent Variable', multiple: false },
+      { key: 'subject', label: 'Subject / Grouping (random)', multiple: false },
+      { key: 'covariates', label: 'Covariate(s)', multiple: true },
+    ],
+    collect: (m) => {
+      const dep = m.values('dependent');
+      const subject = m.values('subject');
+      if (dep.length !== 1) return 'Select exactly one dependent variable.';
+      if (subject.length !== 1) return 'Select one subject/grouping variable.';
+      return { dependent: dep[0], subject: subject[0], covariates: m.values('covariates') };
+    },
+  },
+  survival_km: {
+    title: 'Kaplan-Meier Survival',
+    procedure: 'survival_km',
+    slots: [
+      { key: 'time', label: 'Time', multiple: false },
+      { key: 'status', label: 'Status', multiple: false },
+      { key: 'factor', label: 'Factor (optional)', multiple: false },
+    ],
+    extras: (b) => b.appendChild(numberField('Event value (status =)', 'eventValue', '1')),
+    collect: (m, b) => {
+      const time = m.values('time');
+      const status = m.values('status');
+      if (time.length !== 1) return 'Select one time variable.';
+      if (status.length !== 1) return 'Select one status variable.';
+      const eventValue = (b.querySelector('[data-key="eventValue"]') as HTMLInputElement).value.trim();
+      if (eventValue === '') return 'Enter the value of the status variable that marks an event.';
+      const factor = m.values('factor');
+      const params: Record<string, unknown> = { time: time[0], status: status[0], eventValue };
+      if (factor.length === 1) params['factor'] = factor[0];
+      return params;
+    },
+  },
+  cox_regression: {
+    title: 'Cox Regression',
+    procedure: 'cox_regression',
+    slots: [
+      { key: 'time', label: 'Time', multiple: false },
+      { key: 'status', label: 'Status', multiple: false },
+      { key: 'covariates', label: 'Covariates', multiple: true },
+    ],
+    extras: (b) => b.appendChild(numberField('Event value (status =)', 'eventValue', '1')),
+    collect: (m, b) => {
+      const time = m.values('time');
+      const status = m.values('status');
+      const covariates = m.values('covariates');
+      if (time.length !== 1) return 'Select one time variable.';
+      if (status.length !== 1) return 'Select one status variable.';
+      if (covariates.length === 0) return 'Select at least one covariate.';
+      const eventValue = (b.querySelector('[data-key="eventValue"]') as HTMLInputElement).value.trim();
+      if (eventValue === '') return 'Enter the value of the status variable that marks an event.';
+      return { time: time[0], status: status[0], covariates, eventValue };
+    },
+  },
+  glm_repeated: {
+    title: 'Repeated Measures',
+    procedure: 'glm_repeated',
+    slots: [{ key: 'vars', label: 'Within-Subject Levels', multiple: true }],
+    collect: (m) => {
+      const vars = m.values('vars');
+      if (vars.length < 2) return 'Select at least two within-subject levels.';
+      return { vars };
+    },
+  },
   factor: {
     title: 'Factor Analysis',
     procedure: 'factor',
@@ -478,6 +564,7 @@ export function openChartDialog(kind: string, onDone: () => void): void {
     try {
       const chart = await window.electron.analysis.chart(spec.kind, params);
       outputStore.appendChart(chart as ChartData);
+      syntaxStore.append(syntaxLine('CHART', spec.kind, params));
       onDone();
       return true;
     } catch (err) {
@@ -624,6 +711,7 @@ async function runProcedure(
   try {
     const result = await window.electron.analysis.run(procedure, params);
     outputStore.appendAnalysis(result as Analysis);
+    syntaxStore.append(syntaxLine('RUN', procedure, params));
     onDone();
     return true;
   } catch (err) {

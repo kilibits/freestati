@@ -625,6 +625,32 @@ impl Engine {
                 &p_strs_opt(params, "factors"),
                 &p_strs_opt(params, "covariates"),
             ),
+            "glm_multivariate" => self.glm_multivariate(
+                df,
+                &p_strs(params, "dependents")?,
+                &p_str(params, "factor")?,
+            ),
+            "mixed_model" => self.mixed_model(
+                df,
+                &p_str(params, "dependent")?,
+                &p_str(params, "subject")?,
+                &p_strs_opt(params, "covariates"),
+            ),
+            "survival_km" => self.survival_km(
+                df,
+                &p_str(params, "time")?,
+                &p_str(params, "status")?,
+                &p_str_opt(params, "eventValue").unwrap_or_else(|| "1".into()),
+                p_str_opt(params, "factor").as_deref(),
+            ),
+            "cox_regression" => self.cox_regression(
+                df,
+                &p_str(params, "time")?,
+                &p_str(params, "status")?,
+                &p_str_opt(params, "eventValue").unwrap_or_else(|| "1".into()),
+                &p_strs(params, "covariates")?,
+            ),
+            "glm_repeated" => self.glm_repeated(df, &p_strs(params, "vars")?),
             other => Err(format!("Unknown procedure: {other}")),
         }
     }
@@ -2230,6 +2256,720 @@ impl Engine {
         })
     }
 
+    // ── GLM Multivariate (one-way MANOVA) ─────────────────────────────────────
+
+    fn glm_multivariate(
+        &self,
+        df: &DataFrame,
+        dependents: &[String],
+        factor: &str,
+    ) -> SResult<Analysis> {
+        let p = dependents.len();
+        if p < 2 {
+            return Err("MANOVA needs at least 2 dependent variables".into());
+        }
+        let cols: Vec<Vec<Option<f64>>> =
+            dependents.iter().map(|v| col_opt(df, v)).collect::<SResult<_>>()?;
+        let labels = col_labels(df, factor)?;
+        let nrows = df.height();
+
+        // Listwise-deleted rows grouped by factor level.
+        let mut groups: BTreeMap<String, Vec<Vec<f64>>> = BTreeMap::new();
+        let mut all: Vec<Vec<f64>> = Vec::new();
+        for i in 0..nrows {
+            if labels[i].is_none() || cols.iter().any(|c| c[i].is_none()) {
+                continue;
+            }
+            let row: Vec<f64> = cols.iter().map(|c| c[i].unwrap()).collect();
+            all.push(row.clone());
+            groups.entry(labels[i].clone().unwrap()).or_default().push(row);
+        }
+        let k = groups.len();
+        let total_n = all.len();
+        if k < 2 {
+            return Err(format!("'{factor}' must have at least 2 groups"));
+        }
+        if total_n <= p + k {
+            return Err("Not enough complete cases for MANOVA".into());
+        }
+
+        let grand: Vec<f64> = (0..p)
+            .map(|j| all.iter().map(|r| r[j]).sum::<f64>() / total_n as f64)
+            .collect();
+
+        // Error (within) and Hypothesis (between) SSCP matrices.
+        let mut e = vec![vec![0.0; p]; p];
+        let mut h = vec![vec![0.0; p]; p];
+        for g in groups.values() {
+            let ng = g.len() as f64;
+            let gmean: Vec<f64> = (0..p).map(|j| g.iter().map(|r| r[j]).sum::<f64>() / ng).collect();
+            for r in g {
+                for a in 0..p {
+                    for b in 0..p {
+                        e[a][b] += (r[a] - gmean[a]) * (r[b] - gmean[b]);
+                    }
+                }
+            }
+            for a in 0..p {
+                for b in 0..p {
+                    h[a][b] += ng * (gmean[a] - grand[a]) * (gmean[b] - grand[b]);
+                }
+            }
+        }
+
+        let df_h = (k - 1) as f64;
+        let df_e = (total_n - k) as f64;
+
+        // Eigenvalues of E⁻¹H via the symmetric form E^(−1/2) H E^(−1/2).
+        let inv_sqrt = sym_inv_sqrt(&e).ok_or("Error matrix is singular")?;
+        let s_mat = mat_mul(&mat_mul(&inv_sqrt, &h), &inv_sqrt);
+        let (mut eig, _) = jacobi_eigen(&s_mat);
+        eig.iter_mut().for_each(|l| {
+            if *l < 0.0 {
+                *l = 0.0;
+            }
+        });
+        eig.sort_by(|a, b| b.partial_cmp(a).unwrap());
+
+        let s = (p as f64).min(df_h);
+        let pillai: f64 = eig.iter().map(|&l| l / (1.0 + l)).sum();
+        let wilks: f64 = eig.iter().map(|&l| 1.0 / (1.0 + l)).product();
+        let hotelling: f64 = eig.iter().sum();
+        let roy = eig[0];
+
+        let mut mv = OutTable::new(
+            format!("Multivariate Tests — {factor}"),
+            vec!["Effect", "Value", "F", "Hypothesis df", "Error df", "Sig."],
+        );
+        // F approximations (Rao / Pillai / Lawley-Hotelling / Roy upper bound).
+        let pf = p as f64;
+        let m = (pf - df_h).abs() / 2.0 - 0.5;
+        let nn = (df_e - pf - 1.0) / 2.0;
+
+        // Pillai.
+        if s > 0.0 {
+            let df1 = s * (2.0 * m + s + 1.0);
+            let df2 = s * (2.0 * nn + s + 1.0);
+            let f = ((2.0 * nn + s + 1.0) / (2.0 * m + s + 1.0)) * (pillai / (s - pillai));
+            mv.rows.push(row_mv("Pillai's Trace", pillai, f, df1, df2));
+        }
+        // Wilks' Lambda (Rao's F).
+        {
+            let r = df_e - (pf - df_h + 1.0) / 2.0;
+            let denom = pf * pf + df_h * df_h - 5.0;
+            let t = if denom > 0.0 {
+                ((pf * pf * df_h * df_h - 4.0) / denom).sqrt()
+            } else {
+                1.0
+            };
+            let u = (pf * df_h - 2.0) / 4.0;
+            let df1 = pf * df_h;
+            let df2 = r * t - 2.0 * u;
+            let lam_t = wilks.powf(1.0 / t);
+            let f = ((1.0 - lam_t) / lam_t) * (df2 / df1);
+            mv.rows.push(row_mv("Wilks' Lambda", wilks, f, df1, df2));
+        }
+        // Hotelling-Lawley Trace.
+        if s > 0.0 {
+            let df1 = s * (2.0 * m + s + 1.0);
+            let df2 = 2.0 * (s * nn + 1.0);
+            let f = (df2 * hotelling) / (s * s * (2.0 * m + s + 1.0));
+            mv.rows.push(row_mv("Hotelling's Trace", hotelling, f, df1, df2));
+        }
+        // Roy's Largest Root (upper-bound F).
+        {
+            let d = pf.max(df_h);
+            let df1 = d;
+            let df2 = df_e - d + df_h;
+            let f = roy * df2 / df1;
+            mv.rows.push(row_mv("Roy's Largest Root", roy, f, df1, df2));
+        }
+
+        // Per-DV univariate ANOVAs (between-subjects).
+        let mut uni = OutTable::new(
+            "Tests of Between-Subjects Effects",
+            vec!["Dependent Variable", "F", "df1", "df2", "Sig.", "Partial Eta Squared"],
+        );
+        for (j, dep) in dependents.iter().enumerate() {
+            let ss_b = h[j][j];
+            let ss_w = e[j][j];
+            let f = (ss_b / df_h) / (ss_w / df_e);
+            let partial = ss_b / (ss_b + ss_w);
+            uni.rows.push(vec![
+                text(self.display(dep)),
+                num(f),
+                num(df_h),
+                num(df_e),
+                num(f_sig(f, df_h, df_e)),
+                num(partial),
+            ]);
+        }
+
+        Ok(Analysis {
+            title: "GLM Multivariate (MANOVA)".into(),
+            tables: vec![mv, uni],
+        })
+    }
+
+    // ── Linear Mixed Model (random intercept) ─────────────────────────────────
+
+    fn mixed_model(
+        &self,
+        df: &DataFrame,
+        dependent: &str,
+        subject: &str,
+        covariates: &[String],
+    ) -> SResult<Analysis> {
+        let y_all = col_opt(df, dependent)?;
+        let subj_all = col_labels(df, subject)?;
+        let cov_all: Vec<Vec<Option<f64>>> =
+            covariates.iter().map(|c| col_opt(df, c)).collect::<SResult<_>>()?;
+        let nrows = df.height();
+
+        let mut y = Vec::new();
+        let mut subj = Vec::new();
+        let mut x: Vec<Vec<f64>> = Vec::new(); // intercept + covariates
+        for i in 0..nrows {
+            if y_all[i].is_none() || subj_all[i].is_none() || cov_all.iter().any(|c| c[i].is_none()) {
+                continue;
+            }
+            y.push(y_all[i].unwrap());
+            subj.push(subj_all[i].clone().unwrap());
+            let mut row = vec![1.0];
+            for c in &cov_all {
+                row.push(c[i].unwrap());
+            }
+            x.push(row);
+        }
+        let n = y.len();
+        let p = 1 + covariates.len();
+        if n <= p + 1 {
+            return Err("Not enough complete cases".into());
+        }
+
+        // Group by subject; precompute per-group sufficient statistics that are
+        // independent of the variance ratio γ = σ²_u / σ²_e.
+        let mut order: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for i in 0..n {
+            order.entry(subj[i].clone()).or_default().push(i);
+        }
+        if order.len() < 2 {
+            return Err(format!("'{subject}' must have at least 2 levels"));
+        }
+        struct GStat {
+            ni: f64,
+            xtx: Vec<Vec<f64>>, // X_i' X_i
+            xty: Vec<f64>,      // X_i' y_i
+            s: Vec<f64>,        // X_i' 1
+            sy: f64,            // 1' y_i
+            yty: f64,           // y_i' y_i
+        }
+        let mut gstats: Vec<GStat> = Vec::new();
+        for idxs in order.values() {
+            let mut xtx = vec![vec![0.0; p]; p];
+            let mut xty = vec![0.0; p];
+            let mut s = vec![0.0; p];
+            let mut sy = 0.0;
+            let mut yty = 0.0;
+            for &i in idxs {
+                sy += y[i];
+                yty += y[i] * y[i];
+                for a in 0..p {
+                    s[a] += x[i][a];
+                    xty[a] += x[i][a] * y[i];
+                    for b in 0..p {
+                        xtx[a][b] += x[i][a] * x[i][b];
+                    }
+                }
+            }
+            gstats.push(GStat { ni: idxs.len() as f64, xtx, xty, s, sy, yty });
+        }
+
+        // GLS solve at a given γ; returns (β̂, A⁻¹, rss, ln|A|, Σ ln|V*_i|).
+        let np = (n - p) as f64;
+        let solve = |gamma: f64| -> Option<(Vec<f64>, Vec<Vec<f64>>, f64, f64, f64)> {
+            let mut a = vec![vec![0.0; p]; p];
+            let mut bvec = vec![0.0; p];
+            let mut ytvy = 0.0;
+            let mut logdet_v = 0.0;
+            for g in &gstats {
+                let c = gamma / (1.0 + g.ni * gamma); // V*_i⁻¹ = I − c·J
+                logdet_v += (1.0 + g.ni * gamma).ln();
+                ytvy += g.yty - c * g.sy * g.sy;
+                for a_i in 0..p {
+                    bvec[a_i] += g.xty[a_i] - c * g.s[a_i] * g.sy;
+                    for b_i in 0..p {
+                        a[a_i][b_i] += g.xtx[a_i][b_i] - c * g.s[a_i] * g.s[b_i];
+                    }
+                }
+            }
+            let ainv = invert(a.clone())?;
+            let ld_a = log_det(a)?;
+            let beta: Vec<f64> = (0..p).map(|i| (0..p).map(|j| ainv[i][j] * bvec[j]).sum()).collect();
+            let rss = ytvy - (0..p).map(|i| beta[i] * bvec[i]).sum::<f64>();
+            Some((beta, ainv, rss, ld_a, logdet_v))
+        };
+
+        // −2 REML deviance to minimise over γ (profiled over σ²_e).
+        let deviance = |gamma: f64| -> f64 {
+            match solve(gamma) {
+                Some((_, _, rss, ld_a, ld_v)) if rss > 0.0 => np * (rss / np).ln() + ld_v + ld_a,
+                _ => f64::INFINITY,
+            }
+        };
+
+        // Golden-section search over θ where γ = exp(θ); compare with γ = 0.
+        let gr = (5.0_f64.sqrt() - 1.0) / 2.0;
+        let (mut lo, mut hi) = (-15.0_f64, 8.0_f64);
+        let mut c1 = hi - gr * (hi - lo);
+        let mut c2 = lo + gr * (hi - lo);
+        let mut f1 = deviance(c1.exp());
+        let mut f2 = deviance(c2.exp());
+        for _ in 0..120 {
+            if f1 < f2 {
+                hi = c2;
+                c2 = c1;
+                f2 = f1;
+                c1 = hi - gr * (hi - lo);
+                f1 = deviance(c1.exp());
+            } else {
+                lo = c1;
+                c1 = c2;
+                f1 = f2;
+                c2 = lo + gr * (hi - lo);
+                f2 = deviance(c2.exp());
+            }
+        }
+        let gamma_opt = (0.5 * (lo + hi)).exp();
+        // No random effect (γ = 0) can be the REML optimum on the boundary.
+        let gamma = if deviance(0.0) <= deviance(gamma_opt) { 0.0 } else { gamma_opt };
+
+        let (beta, ainv, rss, ld_a, ld_v) =
+            solve(gamma).ok_or("REML solve failed (collinear design)")?;
+        let var_resid = rss / np;
+        let var_subject = gamma * var_resid;
+        let icc = var_subject / (var_subject + var_resid);
+        let neg2ll = np * (rss / np).ln() + ld_v + ld_a + np * (1.0 + (2.0 * std::f64::consts::PI).ln());
+
+        // Fixed effects (Wald z tests; LMM denominator df is approximate).
+        let mut fixed = OutTable::new(
+            "Fixed Effects Estimates",
+            vec!["", "Estimate", "Std. Error", "z", "Sig.", "95% CI Lower", "95% CI Upper"],
+        )
+        .footnote("REML estimation; significance from Wald z (large-sample) tests.");
+        for a in 0..p {
+            let se = (var_resid * ainv[a][a]).sqrt();
+            let z = beta[a] / se;
+            let label = if a == 0 {
+                "(Intercept)".to_string()
+            } else {
+                self.display(&covariates[a - 1])
+            };
+            fixed.rows.push(vec![
+                text(label),
+                num(beta[a]),
+                num(se),
+                num(z),
+                num(z_sig_2tailed(z)),
+                num(beta[a] - 1.959964 * se),
+                num(beta[a] + 1.959964 * se),
+            ]);
+        }
+
+        let mut vc = OutTable::new(
+            "Covariance Parameters (REML)",
+            vec!["", "Variance", "Std. Deviation"],
+        );
+        vc.rows.push(vec![
+            text(format!("{} (intercept)", self.display(subject))),
+            num(var_subject),
+            num(var_subject.sqrt()),
+        ]);
+        vc.rows.push(vec![text("Residual"), num(var_resid), num(var_resid.sqrt())]);
+
+        let mut info = OutTable::new("Model & Intraclass Correlation", vec!["", "Value"]);
+        info.rows.push(vec![text("ICC"), num(icc)]);
+        info.rows.push(vec![text("−2 Restricted Log Likelihood"), num(neg2ll)]);
+
+        Ok(Analysis {
+            title: "Linear Mixed Model (random intercept, REML)".into(),
+            tables: vec![fixed, vc, info],
+        })
+    }
+
+    // ── Survival analysis (Kaplan-Meier + log-rank) ───────────────────────────
+
+    fn survival_km(
+        &self,
+        df: &DataFrame,
+        time: &str,
+        status: &str,
+        event_value: &str,
+        factor: Option<&str>,
+    ) -> SResult<Analysis> {
+        let times = col_opt(df, time)?;
+        let stat_labels = col_labels(df, status)?;
+        let group_labels = match factor {
+            Some(f) => Some(col_labels(df, f)?),
+            None => None,
+        };
+        let nrows = df.height();
+
+        // (time, event?, group) tuples after listwise deletion.
+        let mut obs: Vec<(f64, bool, String)> = Vec::new();
+        for i in 0..nrows {
+            let (Some(t), Some(s)) = (times[i], stat_labels[i].clone()) else {
+                continue;
+            };
+            let grp = match &group_labels {
+                Some(g) => match &g[i] {
+                    Some(l) => l.clone(),
+                    None => continue,
+                },
+                None => "All".to_string(),
+            };
+            obs.push((t, s == event_value, grp));
+        }
+        if obs.len() < 2 {
+            return Err("Not enough valid cases".into());
+        }
+
+        let mut tables = Vec::new();
+        let mut groups: BTreeMap<String, Vec<(f64, bool)>> = BTreeMap::new();
+        for (t, ev, g) in &obs {
+            groups.entry(g.clone()).or_default().push((*t, *ev));
+        }
+
+        // Kaplan-Meier table + median per group.
+        let mut summary = OutTable::new(
+            "Survival Summary",
+            vec!["Group", "N", "Events", "Censored", "Median Survival"],
+        );
+        for (g, data) in &groups {
+            let km = self.km_table(g, data);
+            tables.push(km.0);
+            let events = data.iter().filter(|(_, e)| *e).count();
+            summary.rows.push(vec![
+                text(g),
+                int(data.len() as i64),
+                int(events as i64),
+                int((data.len() - events) as i64),
+                km.1.map(num).unwrap_or(JsonValue::Null),
+            ]);
+        }
+        tables.insert(0, summary);
+
+        // Log-rank test across groups.
+        if groups.len() >= 2 {
+            tables.push(log_rank(&groups)?);
+        }
+
+        Ok(Analysis {
+            title: format!("Kaplan-Meier — {}", self.display(time)),
+            tables,
+        })
+    }
+
+    /// Build a Kaplan-Meier survival table for one group; returns (table, median).
+    fn km_table(&self, group: &str, data: &[(f64, bool)]) -> (OutTable, Option<f64>) {
+        let mut d = data.to_vec();
+        d.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut t = OutTable::new(
+            format!("Survival Table — {group}"),
+            vec!["Time", "N at Risk", "Events", "Survival", "Std. Error"],
+        );
+        let mut surv = 1.0;
+        let mut var_sum = 0.0; // Greenwood accumulation
+        let mut median = None;
+        let total = d.len();
+        let mut idx = 0;
+        while idx < total {
+            let time = d[idx].0;
+            let n_risk = (total - idx) as f64;
+            // Count events and total records at this exact time.
+            let mut events = 0.0;
+            let mut tied = 0;
+            while idx + tied < total && d[idx + tied].0 == time {
+                if d[idx + tied].1 {
+                    events += 1.0;
+                }
+                tied += 1;
+            }
+            if events > 0.0 {
+                surv *= 1.0 - events / n_risk;
+                var_sum += events / (n_risk * (n_risk - events));
+                let se = surv * var_sum.sqrt();
+                t.rows.push(vec![
+                    num(time),
+                    num(n_risk),
+                    num(events),
+                    num(surv),
+                    num(se),
+                ]);
+                if median.is_none() && surv <= 0.5 {
+                    median = Some(time);
+                }
+            }
+            idx += tied;
+        }
+        (t, median)
+    }
+
+    // ── Cox proportional-hazards regression ───────────────────────────────────
+
+    fn cox_regression(
+        &self,
+        df: &DataFrame,
+        time: &str,
+        status: &str,
+        event_value: &str,
+        covariates: &[String],
+    ) -> SResult<Analysis> {
+        let p = covariates.len();
+        if p == 0 {
+            return Err("Cox regression needs at least one covariate".into());
+        }
+        let times = col_opt(df, time)?;
+        let stat_labels = col_labels(df, status)?;
+        let cov_cols: Vec<Vec<Option<f64>>> =
+            covariates.iter().map(|c| col_opt(df, c)).collect::<SResult<_>>()?;
+        let nrows = df.height();
+
+        // Listwise deletion; record (time, event, centered covariate vector).
+        let mut t = Vec::new();
+        let mut ev = Vec::new();
+        let mut x: Vec<Vec<f64>> = Vec::new();
+        for i in 0..nrows {
+            let (Some(ti), Some(sl)) = (times[i], stat_labels[i].clone()) else {
+                continue;
+            };
+            if cov_cols.iter().any(|c| c[i].is_none()) {
+                continue;
+            }
+            t.push(ti);
+            ev.push(sl == event_value);
+            x.push(cov_cols.iter().map(|c| c[i].unwrap()).collect());
+        }
+        let n = t.len();
+        let n_events = ev.iter().filter(|&&e| e).count();
+        if n_events == 0 {
+            return Err("No events (uncensored cases) found".into());
+        }
+        if n <= p + 1 {
+            return Err("Not enough complete cases".into());
+        }
+
+        // Centre covariates (coefficients are invariant; improves conditioning).
+        let means: Vec<f64> = (0..p)
+            .map(|j| x.iter().map(|r| r[j]).sum::<f64>() / n as f64)
+            .collect();
+        for row in &mut x {
+            for j in 0..p {
+                row[j] -= means[j];
+            }
+        }
+
+        // Order indices by time ascending for risk-set sweeps.
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| t[a].partial_cmp(&t[b]).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Partial log-likelihood, score, and information at β (Breslow ties).
+        let eval = |beta: &[f64]| -> (f64, Vec<f64>, Vec<Vec<f64>>) {
+            let mut ll = 0.0;
+            let mut score = vec![0.0; p];
+            let mut info = vec![vec![0.0; p]; p];
+            // Sweep from longest time to shortest, accumulating the risk set.
+            let mut s0 = 0.0;
+            let mut s1 = vec![0.0; p];
+            let mut s2 = vec![vec![0.0; p]; p];
+            for &i in order.iter().rev() {
+                let eta: f64 = (0..p).map(|j| beta[j] * x[i][j]).sum();
+                let w = eta.exp();
+                s0 += w;
+                for a in 0..p {
+                    s1[a] += w * x[i][a];
+                    for b in 0..p {
+                        s2[a][b] += w * x[i][a] * x[i][b];
+                    }
+                }
+                if ev[i] {
+                    let eta_i: f64 = (0..p).map(|j| beta[j] * x[i][j]).sum();
+                    ll += eta_i - s0.ln();
+                    for a in 0..p {
+                        let ea = s1[a] / s0;
+                        score[a] += x[i][a] - ea;
+                        for b in 0..p {
+                            let eb = s1[b] / s0;
+                            info[a][b] += s2[a][b] / s0 - ea * eb;
+                        }
+                    }
+                }
+            }
+            (ll, score, info)
+        };
+
+        // Newton-Raphson.
+        let mut beta = vec![0.0; p];
+        let ll0 = eval(&vec![0.0; p]).0;
+        let mut ll = ll0;
+        let mut last_info = vec![vec![0.0; p]; p];
+        for _ in 0..50 {
+            let (cur_ll, score, info) = eval(&beta);
+            ll = cur_ll;
+            last_info = info.clone();
+            let inv = invert(info).ok_or("Information matrix is singular (collinear covariates)")?;
+            let step: Vec<f64> = (0..p).map(|a| (0..p).map(|b| inv[a][b] * score[b]).sum()).collect();
+            let mut max_step = 0.0_f64;
+            for a in 0..p {
+                beta[a] += step[a];
+                max_step = max_step.max(step[a].abs());
+            }
+            if max_step < 1e-8 {
+                break;
+            }
+        }
+        let inv = invert(last_info).ok_or("Information matrix is singular")?;
+
+        // Omnibus likelihood-ratio test.
+        let lr = 2.0 * (ll - ll0);
+        let mut omni = OutTable::new(
+            "Omnibus Tests of Model Coefficients",
+            vec!["-2 Log Likelihood", "Chi-Square (LR)", "df", "Sig."],
+        );
+        omni.rows.push(vec![
+            num(-2.0 * ll),
+            num(lr),
+            num(p as f64),
+            num(chi2_sig(lr, p as f64)),
+        ]);
+
+        // Variables in the Equation.
+        let mut vars = OutTable::new(
+            "Variables in the Equation",
+            vec![
+                "",
+                "B",
+                "SE",
+                "Wald",
+                "df",
+                "Sig.",
+                "Exp(B)",
+                "95% CI Lower",
+                "95% CI Upper",
+            ],
+        );
+        for j in 0..p {
+            let se = inv[j][j].sqrt();
+            let wald = (beta[j] / se).powi(2);
+            vars.rows.push(vec![
+                text(self.display(&covariates[j])),
+                num(beta[j]),
+                num(se),
+                num(wald),
+                int(1),
+                num(chi2_sig(wald, 1.0)),
+                num(beta[j].exp()),
+                num((beta[j] - 1.959964 * se).exp()),
+                num((beta[j] + 1.959964 * se).exp()),
+            ]);
+        }
+
+        Ok(Analysis {
+            title: format!("Cox Regression — {}", self.display(time)),
+            tables: vec![omni, vars],
+        })
+    }
+
+    // ── Repeated-measures GLM (within-subjects ANOVA) ─────────────────────────
+
+    fn glm_repeated(&self, df: &DataFrame, vars: &[String]) -> SResult<Analysis> {
+        let k = vars.len();
+        if k < 2 {
+            return Err("Select at least 2 within-subjects levels".into());
+        }
+        // Listwise-deleted subject × condition matrix.
+        let cols: Vec<Vec<Option<f64>>> =
+            vars.iter().map(|v| col_opt(df, v)).collect::<SResult<_>>()?;
+        let nrows = df.height();
+        let mut data: Vec<Vec<f64>> = Vec::new();
+        for i in 0..nrows {
+            if cols.iter().all(|c| c[i].is_some()) {
+                data.push(cols.iter().map(|c| c[i].unwrap()).collect());
+            }
+        }
+        let n = data.len();
+        if n < 2 {
+            return Err("Not enough complete cases".into());
+        }
+        let nf = n as f64;
+        let kf = k as f64;
+
+        let grand = data.iter().flat_map(|r| r.iter()).sum::<f64>() / (nf * kf);
+        let cond_means: Vec<f64> = (0..k).map(|j| data.iter().map(|r| r[j]).sum::<f64>() / nf).collect();
+        let subj_means: Vec<f64> = data.iter().map(|r| r.iter().sum::<f64>() / kf).collect();
+
+        let ss_cond = nf * cond_means.iter().map(|m| (m - grand).powi(2)).sum::<f64>();
+        let ss_subj = kf * subj_means.iter().map(|m| (m - grand).powi(2)).sum::<f64>();
+        let mut ss_total = 0.0;
+        for row in &data {
+            for j in 0..k {
+                ss_total += (row[j] - grand).powi(2);
+            }
+        }
+        let ss_error = ss_total - ss_cond - ss_subj;
+        let df_cond = kf - 1.0;
+        let df_error = (kf - 1.0) * (nf - 1.0);
+        let ms_cond = ss_cond / df_cond;
+        let ms_error = ss_error / df_error;
+        let f = ms_cond / ms_error;
+
+        // Greenhouse-Geisser epsilon from the covariance matrix of the levels.
+        let eps = greenhouse_geisser(&data, &cond_means);
+        let gg_df1 = df_cond * eps;
+        let gg_df2 = df_error * eps;
+
+        let mut t = OutTable::new(
+            "Tests of Within-Subjects Effects",
+            vec!["Source", "Sum of Squares", "df", "Mean Square", "F", "Sig."],
+        );
+        t.rows.push(vec![
+            text("Factor (Sphericity Assumed)"),
+            num(ss_cond),
+            num(df_cond),
+            num(ms_cond),
+            num(f),
+            num(f_sig(f, df_cond, df_error)),
+        ]);
+        t.rows.push(vec![
+            text("Factor (Greenhouse-Geisser)"),
+            num(ss_cond),
+            num(gg_df1),
+            num(ss_cond / gg_df1),
+            num(f),
+            num(f_sig(f, gg_df1, gg_df2)),
+        ]);
+        t.rows.push(vec![
+            text("Error (Sphericity Assumed)"),
+            num(ss_error),
+            num(df_error),
+            num(ms_error),
+            JsonValue::Null,
+            JsonValue::Null,
+        ]);
+        let t = t.footnote(format!("Greenhouse-Geisser ε = {eps:.3}. n = {n} subjects, {k} levels."));
+
+        // Within-subjects descriptives.
+        let mut desc = OutTable::new("Descriptive Statistics", vec!["", "Mean", "N"]);
+        for (j, v) in vars.iter().enumerate() {
+            desc.rows.push(vec![text(self.display(v)), num(cond_means[j]), int(n as i64)]);
+        }
+
+        Ok(Analysis {
+            title: "Repeated Measures ANOVA".into(),
+            tables: vec![desc, t],
+        })
+    }
+
     // ── Charts ────────────────────────────────────────────────────────────────
 
     /// Compute chart data for the Graphs menu. Aggregation happens here so the
@@ -2709,6 +3449,172 @@ struct Effect {
     cols: Vec<Vec<f64>>,
 }
 
+/// Greenhouse-Geisser sphericity correction ε (Box's formula) from repeated-
+/// measures data (`data[subject][level]`). Clamped to [1/(k−1), 1].
+fn greenhouse_geisser(data: &[Vec<f64>], means: &[f64]) -> f64 {
+    let n = data.len() as f64;
+    let k = means.len();
+    if k < 2 || n < 2.0 {
+        return 1.0;
+    }
+    // Sample covariance matrix S (k × k).
+    let mut s = vec![vec![0.0; k]; k];
+    for row in data {
+        for a in 0..k {
+            for b in 0..k {
+                s[a][b] += (row[a] - means[a]) * (row[b] - means[b]);
+            }
+        }
+    }
+    for a in 0..k {
+        for b in 0..k {
+            s[a][b] /= n - 1.0;
+        }
+    }
+    let kf = k as f64;
+    let diag_mean = (0..k).map(|i| s[i][i]).sum::<f64>() / kf;
+    let grand = s.iter().flat_map(|r| r.iter()).sum::<f64>() / (kf * kf);
+    let row_means: Vec<f64> = s.iter().map(|r| r.iter().sum::<f64>() / kf).collect();
+    let sum_sq: f64 = s.iter().flat_map(|r| r.iter()).map(|v| v * v).sum();
+    let sum_row_sq: f64 = row_means.iter().map(|m| m * m).sum();
+
+    let numer = kf * kf * (diag_mean - grand).powi(2);
+    let denom = (kf - 1.0) * (sum_sq - 2.0 * kf * sum_row_sq + kf * kf * grand * grand);
+    if denom <= 0.0 {
+        return 1.0;
+    }
+    (numer / denom).clamp(1.0 / (kf - 1.0), 1.0)
+}
+
+/// One row of a MANOVA "Multivariate Tests" table.
+fn row_mv(name: &str, value: f64, f: f64, df1: f64, df2: f64) -> Vec<JsonValue> {
+    vec![
+        text(name),
+        num(value),
+        num(f),
+        num(df1),
+        num(df2),
+        num(f_sig(f, df1, df2)),
+    ]
+}
+
+/// Log-rank (Mantel-Cox) test across `groups` of (time, event) data. Builds the
+/// observed/expected table and the overall chi-square via the (k−1) covariance.
+fn log_rank(groups: &BTreeMap<String, Vec<(f64, bool)>>) -> SResult<OutTable> {
+    let names: Vec<&String> = groups.keys().collect();
+    let g = names.len();
+    let data: Vec<&Vec<(f64, bool)>> = names.iter().map(|n| &groups[*n]).collect();
+
+    // All distinct event times across groups.
+    let mut event_times: Vec<f64> = groups
+        .values()
+        .flat_map(|d| d.iter().filter(|(_, e)| *e).map(|(t, _)| *t))
+        .collect();
+    event_times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    event_times.dedup();
+
+    let mut observed = vec![0.0; g];
+    let mut expected = vec![0.0; g];
+    // (k−1) × (k−1) covariance of (O − E).
+    let mut cov = vec![vec![0.0; g - 1]; g - 1];
+
+    for &et in &event_times {
+        let at_risk: Vec<f64> = data
+            .iter()
+            .map(|d| d.iter().filter(|(t, _)| *t >= et).count() as f64)
+            .collect();
+        let d_grp: Vec<f64> = data
+            .iter()
+            .map(|d| d.iter().filter(|(t, e)| *e && *t == et).count() as f64)
+            .collect();
+        let n: f64 = at_risk.iter().sum();
+        let dt: f64 = d_grp.iter().sum();
+        if n <= 1.0 {
+            continue;
+        }
+        for i in 0..g {
+            observed[i] += d_grp[i];
+            expected[i] += dt * at_risk[i] / n;
+        }
+        let factor = dt * (n - dt) / (n - 1.0);
+        for i in 0..(g - 1) {
+            for j in 0..(g - 1) {
+                let kron = if i == j { 1.0 } else { 0.0 };
+                cov[i][j] += factor * (kron * at_risk[i] / n - at_risk[i] * at_risk[j] / (n * n));
+            }
+        }
+    }
+
+    let diff: Vec<f64> = (0..(g - 1)).map(|i| observed[i] - expected[i]).collect();
+    let chi = match invert(cov) {
+        Some(ci) => {
+            let mut q = 0.0;
+            for i in 0..(g - 1) {
+                for j in 0..(g - 1) {
+                    q += diff[i] * ci[i][j] * diff[j];
+                }
+            }
+            q
+        }
+        None => f64::NAN,
+    };
+    let dfree = (g - 1) as f64;
+
+    let mut t = OutTable::new(
+        "Overall Comparisons (Log Rank)",
+        vec!["", "Observed", "Expected", "Chi-Square", "df", "Sig."],
+    );
+    for i in 0..g {
+        t.rows.push(vec![
+            text(names[i]),
+            num(observed[i]),
+            num(expected[i]),
+            if i == 0 { num(chi) } else { JsonValue::Null },
+            if i == 0 { num(dfree) } else { JsonValue::Null },
+            if i == 0 { num(chi2_sig(chi, dfree)) } else { JsonValue::Null },
+        ]);
+    }
+    Ok(t)
+}
+
+/// Matrix product A·B for square/compatible row-major matrices.
+fn mat_mul(a: &[Vec<f64>], b: &[Vec<f64>]) -> Vec<Vec<f64>> {
+    let n = a.len();
+    let m = b[0].len();
+    let k = b.len();
+    let mut out = vec![vec![0.0; m]; n];
+    for i in 0..n {
+        for l in 0..k {
+            let ail = a[i][l];
+            for j in 0..m {
+                out[i][j] += ail * b[l][j];
+            }
+        }
+    }
+    out
+}
+
+/// Symmetric inverse square root E^(−1/2) via eigen-decomposition (E symmetric
+/// positive-definite). Returns None if E is singular.
+fn sym_inv_sqrt(e: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
+    let (vals, vecs) = jacobi_eigen(e);
+    let n = e.len();
+    if vals.iter().any(|&l| l <= 1e-12) {
+        return None;
+    }
+    let mut out = vec![vec![0.0; n]; n];
+    for a in 0..n {
+        for b in 0..n {
+            let mut s = 0.0;
+            for j in 0..n {
+                s += vecs[a][j] * vecs[b][j] / vals[j].sqrt();
+            }
+            out[a][b] = s;
+        }
+    }
+    Some(out)
+}
+
 /// OLS residual sum of squares for a design given as column vectors and a
 /// response `y`. Returns None if the normal-equations matrix is singular.
 fn ols_sse(columns: &[&Vec<f64>], y: &[f64]) -> Option<f64> {
@@ -2740,6 +3646,33 @@ fn ols_sse(columns: &[&Vec<f64>], y: &[f64]) -> Option<f64> {
         sse += (y[i] - yhat).powi(2);
     }
     Some(sse)
+}
+
+/// Natural log of |det(A)| via Gaussian elimination with partial pivoting.
+/// Returns None if (near-)singular. Used by the REML mixed-model objective.
+fn log_det(mut a: Vec<Vec<f64>>) -> Option<f64> {
+    let n = a.len();
+    let mut ld = 0.0;
+    for col in 0..n {
+        let mut pivot = col;
+        for r in (col + 1)..n {
+            if a[r][col].abs() > a[pivot][col].abs() {
+                pivot = r;
+            }
+        }
+        if a[pivot][col].abs() < 1e-12 {
+            return None;
+        }
+        a.swap(col, pivot);
+        ld += a[col][col].abs().ln();
+        for r in (col + 1)..n {
+            let factor = a[r][col] / a[col][col];
+            for j in col..n {
+                a[r][j] -= factor * a[col][j];
+            }
+        }
+    }
+    Some(ld)
 }
 
 /// In-place Gauss-Jordan inversion; returns None if singular.
@@ -3057,6 +3990,128 @@ mod tests {
             &serde_json::json!({ "vars": ["y"], "factor": "g", "posthoc": "tukey" }),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn manova_two_groups_consistent() {
+        // With 2 groups (df_h = 1) all four multivariate tests give the same F.
+        let df = df![
+            "y1" => [1.0, 2.0, 3.0, 2.0, 8.0, 9.0, 7.0, 8.0],
+            "y2" => [2.0, 1.0, 2.0, 3.0, 7.0, 8.0, 9.0, 7.0],
+            "g"  => [1i64, 1, 1, 1, 2, 2, 2, 2],
+        ]
+        .unwrap();
+        let mut eng = Engine::default();
+        eng.df = Some(df);
+        let a = eng
+            .run_analysis(
+                "glm_multivariate",
+                &serde_json::json!({ "dependents": ["y1", "y2"], "factor": "g" }),
+            )
+            .unwrap();
+        let fs: Vec<f64> = a.tables[0].rows.iter().map(|r| r[2].as_f64().unwrap()).collect();
+        for f in &fs {
+            close(*f, fs[0], 1e-6);
+        }
+        assert!(fs[0] > 0.0);
+    }
+
+    #[test]
+    fn mixed_and_survival_run() {
+        let df = df![
+            "y"      => [5.0, 6.0, 7.0, 8.0, 3.0, 4.0, 5.0, 6.0],
+            "subj"   => [1i64, 1, 2, 2, 3, 3, 4, 4],
+            "x"      => [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            "time"   => [5.0, 8.0, 12.0, 3.0, 9.0, 15.0, 7.0, 20.0],
+            "status" => [1i64, 1, 0, 1, 1, 0, 1, 0],
+            "grp"    => [1i64, 1, 1, 1, 2, 2, 2, 2],
+        ]
+        .unwrap();
+        let mut eng = Engine::default();
+        eng.df = Some(df);
+        let mm = eng
+            .run_analysis(
+                "mixed_model",
+                &serde_json::json!({ "dependent": "y", "subject": "subj", "covariates": ["x"] }),
+            )
+            .unwrap();
+        // ICC value is the last table's single row, column 1.
+        let icc = mm.tables.last().unwrap().rows[0][1].as_f64().unwrap();
+        assert!((0.0..=1.0).contains(&icc), "ICC out of range: {icc}");
+
+        eng.run_analysis(
+            "survival_km",
+            &serde_json::json!({ "time": "time", "status": "status", "eventValue": "1", "factor": "grp" }),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn cox_recovers_positive_effect() {
+        // Higher x → shorter survival → positive coefficient / HR > 1.
+        // Group x=1 tends to fail earlier but event times overlap, so the MLE
+        // is finite (not separated).
+        let df = df![
+            "time"   => [2.0, 4.0, 6.0, 9.0, 3.0, 5.0, 7.0, 8.0, 10.0],
+            "status" => [1i64, 1, 1, 1, 1, 1, 1, 1, 1],
+            "x"      => [1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ]
+        .unwrap();
+        let mut eng = Engine::default();
+        eng.df = Some(df);
+        let a = eng
+            .run_analysis(
+                "cox_regression",
+                &serde_json::json!({ "time": "time", "status": "status", "eventValue": "1", "covariates": ["x"] }),
+            )
+            .unwrap();
+        // Variables in the Equation: B in column 1, Exp(B) in column 6.
+        let b = a.tables[1].rows[0][1].as_f64().unwrap();
+        let hr = a.tables[1].rows[0][6].as_f64().unwrap();
+        assert!(b > 0.0, "expected positive B, got {b}");
+        assert!(hr > 1.0, "expected HR > 1, got {hr}");
+    }
+
+    #[test]
+    fn reml_balanced_matches_anova() {
+        // Balanced one-way design: REML variance components equal the ANOVA
+        // estimator. Groups with a clear between-subject shift.
+        let df = df![
+            "y"    => [10.0, 11.0, 12.0, 20.0, 21.0, 22.0, 30.0, 31.0, 32.0],
+            "subj" => [1i64, 1, 1, 2, 2, 2, 3, 3, 3],
+        ]
+        .unwrap();
+        let mut eng = Engine::default();
+        eng.df = Some(df);
+        let a = eng
+            .run_analysis("mixed_model", &serde_json::json!({ "dependent": "y", "subject": "subj", "covariates": [] }))
+            .unwrap();
+        // Covariance parameters: residual variance ≈ 1.0 (each group is m-1,m,m+1).
+        let resid = a.tables[1].rows[1][1].as_f64().unwrap();
+        close(resid, 1.0, 1e-3);
+        // Subject variance is large and positive; ICC near 1.
+        let var_subj = a.tables[1].rows[0][1].as_f64().unwrap();
+        assert!(var_subj > 50.0, "expected large subject variance, got {var_subj}");
+        let icc = a.tables[2].rows[0][1].as_f64().unwrap();
+        assert!(icc > 0.95, "expected high ICC, got {icc}");
+    }
+
+    #[test]
+    fn repeated_measures_runs() {
+        let df = df![
+            "t1" => [8.0, 10.0, 9.0, 11.0, 7.0],
+            "t2" => [12.0, 13.0, 11.0, 15.0, 10.0],
+            "t3" => [15.0, 18.0, 16.0, 19.0, 14.0],
+        ]
+        .unwrap();
+        let mut eng = Engine::default();
+        eng.df = Some(df);
+        let a = eng
+            .run_analysis("glm_repeated", &serde_json::json!({ "vars": ["t1", "t2", "t3"] }))
+            .unwrap();
+        // Strong increasing trend with non-zero error → significant within effect.
+        let sig = a.tables[1].rows[0][5].as_f64().unwrap();
+        assert!(sig < 0.01, "expected significant within effect, got {sig}");
     }
 
     #[test]

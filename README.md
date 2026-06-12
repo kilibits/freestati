@@ -13,15 +13,23 @@ alongside `.tsv` and `.csv`.
   Cramér's V), t-tests (one-sample, independent with Levene's test, paired) with
   Cohen's d and 95% CIs, one-way ANOVA with post-hoc (LSD/Bonferroni/Tukey HSD)
   and η², GLM Univariate (factorial ANOVA/ANCOVA, Type III SS), correlation
+  GLM Multivariate (one-way MANOVA: Pillai/Wilks/Hotelling/Roy) and Repeated
+  Measures (within-subjects ANOVA + Greenhouse-Geisser), correlation
   (Pearson/Spearman), linear regression with coefficient CIs, factor analysis
-  (PCA with varimax), reliability (Cronbach's α), and nonparametric tests
-  (Mann-Whitney U, Wilcoxon, Kruskal-Wallis, chi-square) — all computed natively
-  in Rust with no external stats dependency
+  (PCA with varimax), reliability (Cronbach's α), linear mixed models (random
+  intercept, **REML**), survival analysis (Kaplan-Meier + log-rank and **Cox
+  proportional-hazards** regression), and nonparametric tests (Mann-Whitney U,
+  Wilcoxon, Kruskal-Wallis, chi-square) — all computed natively in Rust with no
+  external stats dependency
+- **Syntax & scripting** — every analysis and chart is recorded as a replayable
+  command in a Syntax editor; edit, save/open `.fst` scripts, and re-run an
+  entire session for reproducibility
 - **Charts** — histogram, bar, clustered bar, line, scatter (with fit line), and
   box plots, drawn as dependency-free SVG from engine-side aggregates; export any
   chart to SVG or PNG
 - **Output viewer** — an SPSS-style results pane that accumulates tables and
-  charts, with per-table copy/transpose and HTML export of the whole session
+  charts, with per-table copy / transpose / inline pivot editing, and export of
+  the whole session to HTML, Word, or PDF (print)
 - **File Explorer sidebar** — open a whole folder and load datasets on demand
 - **Virtualized grid** — AG Grid infinite row model scrolls millions of rows without
   loading them all into the WebView
@@ -142,9 +150,10 @@ with real assets before shipping).
 
 ```
 src/renderer/              WebView UI
-├── components/            App, DataView, VariableView, OutputView, FileExplorer,
-│                          StatusBar, dialogs (variable pickers), charts (SVG)
-├── stores/                dataStore (dataset state) · outputStore (results)
+├── components/            App, DataView, VariableView, OutputView, SyntaxView,
+│                          FileExplorer, StatusBar, dialogs (variable pickers),
+│                          charts (SVG), syntax (parse/replay)
+├── stores/                dataStore · outputStore (results) · syntaxStore (script)
 ├── types/                 dataset.ts · analysis.ts (result tables)
 ├── bridge.ts              window.electron shim over Tauri invoke/events/dialog
 ├── global.d.ts            window.electron typings
@@ -162,8 +171,7 @@ scripts/build-renderer.mjs esbuild bundler
 ## Roadmap
 
 - Restore `.xlsx` / `.dta` / `.sas7bdat` reading and `.sav` writing in the Rust engine
-- More procedures (GLM multivariate, mixed models, survival) and options
-- Pivot-table editing in the output viewer; export to PDF/Word
+- Time-varying Cox covariates, crossed/nested random effects, multivariate GLM contrasts
 - Tauri auto-updater
 
 ## License

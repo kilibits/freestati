@@ -3,10 +3,11 @@ import { DataView } from './DataView';
 import { FileExplorer } from './FileExplorer';
 import { OutputView } from './OutputView';
 import { StatusBar } from './StatusBar';
+import { SyntaxView } from './SyntaxView';
 import { VariableView } from './VariableView';
 import { openChartDialog, openProcedureDialog } from './dialogs';
 
-type ActiveView = 'data' | 'variable' | 'output';
+type ActiveView = 'data' | 'variable' | 'output' | 'syntax';
 
 /** Procedures wired to "menu:analyze:<id>" events from the native menu. */
 const ANALYZE_PROCEDURES = [
@@ -18,10 +19,15 @@ const ANALYZE_PROCEDURES = [
   'ttest_paired',
   'anova_oneway',
   'glm_univariate',
+  'glm_multivariate',
+  'glm_repeated',
+  'mixed_model',
   'correlate',
   'regression_linear',
   'factor',
   'reliability',
+  'survival_km',
+  'cox_regression',
   'mann_whitney',
   'wilcoxon',
   'kruskal_wallis',
@@ -35,6 +41,7 @@ export class App {
   private dataView = new DataView();
   private variableView = new VariableView();
   private outputView = new OutputView();
+  private syntaxView = new SyntaxView();
   private statusBar = new StatusBar();
   private fileExplorer = new FileExplorer();
   private activeView: ActiveView = 'data';
@@ -45,6 +52,10 @@ export class App {
     this.dataView.mount(document.getElementById('pane-data')!);
     this.variableView.mount(document.getElementById('pane-variable')!, () => this.dataView.refresh());
     this.outputView.mount(document.getElementById('pane-output')!);
+    this.syntaxView.mount(document.getElementById('pane-syntax')!, () => {
+      this.switchView('output');
+      this.outputView.scrollToBottom();
+    });
     this.statusBar.mount(document.getElementById('status-bar-host')!);
     this.fileExplorer.mount(document.getElementById('sidebar')!, (path) => this.openFilePath(path));
 
@@ -108,6 +119,7 @@ export class App {
     document.getElementById('pane-data')!.style.display = view === 'data' ? 'flex' : 'none';
     document.getElementById('pane-variable')!.style.display = view === 'variable' ? 'flex' : 'none';
     document.getElementById('pane-output')!.style.display = view === 'output' ? 'flex' : 'none';
+    document.getElementById('pane-syntax')!.style.display = view === 'syntax' ? 'flex' : 'none';
   }
 
   // ── Toolbar ───────────────────────────────────────────────────────────────
@@ -149,6 +161,8 @@ export class App {
     window.electron.menu.on('menu:file:saveAs', () => this.saveAs());
     window.electron.menu.on('menu:view:dataView', () => this.switchView('data'));
     window.electron.menu.on('menu:view:variableView', () => this.switchView('variable'));
+    window.electron.menu.on('menu:view:output', () => this.switchView('output'));
+    window.electron.menu.on('menu:view:syntax', () => this.switchView('syntax'));
     window.electron.menu.on('menu:view:explorer', () => this.toggleSidebar());
   }
 

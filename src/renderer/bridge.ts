@@ -93,6 +93,12 @@ const electron = {
       await invoke('save_text_file', { path, contents });
       return path;
     },
+    async exportWord(contents: string): Promise<string | null> {
+      const path = await saveDialog({ filters: [{ name: 'Word Document', extensions: ['doc'] }] });
+      if (!path) return null;
+      await invoke('save_text_file', { path, contents });
+      return path;
+    },
     async exportSvg(contents: string): Promise<string | null> {
       const path = await saveDialog({ filters: [{ name: 'SVG Image', extensions: ['svg'] }] });
       if (!path) return null;
@@ -104,6 +110,20 @@ const electron = {
       if (!path) return null;
       await invoke('save_binary_file', { path, bytes });
       return path;
+    },
+    async exportSyntax(contents: string): Promise<string | null> {
+      const path = await saveDialog({ filters: [{ name: 'FreeStati Syntax', extensions: ['fst', 'txt'] }] });
+      if (!path) return null;
+      await invoke('save_text_file', { path, contents });
+      return path;
+    },
+    async openSyntax(): Promise<string | null> {
+      const path = await openDialog({
+        multiple: false,
+        filters: [{ name: 'FreeStati Syntax', extensions: ['fst', 'txt'] }],
+      });
+      if (typeof path !== 'string') return null;
+      return invoke<string>('read_text_file', { path });
     },
   },
 

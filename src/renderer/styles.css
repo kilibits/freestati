@@ -622,3 +622,49 @@ html, body, #app {
   display: inline-block;
 }
 .output-chart { display: block; }
+
+/* ── Output viewer: pivot-edit + export toolbar ────────────────────────────── */
+.output-toolbar-label { font-size: 11px; color: var(--text-muted); }
+.output-toolbar-sep {
+  width: 1px;
+  height: 18px;
+  background: var(--border);
+  margin: 0 4px;
+}
+.output-table.editing {
+  outline: 1px dashed var(--accent);
+}
+.output-table.editing td,
+.output-table.editing th {
+  cursor: text;
+}
+.output-table.editing td:focus,
+.output-table.editing th:focus {
+  outline: 1px solid var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+.output-chart-title { margin-bottom: 0 !important; }
+
+/* ── Syntax editor ─────────────────────────────────────────────────────────── */
+.syntax-view { flex-direction: column; height: 100%; }
+.syntax-hint {
+  font-size: 11px;
+  color: var(--text-faint);
+  margin-left: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.syntax-editor {
+  flex: 1;
+  width: 100%;
+  resize: none;
+  border: none;
+  outline: none;
+  padding: 12px 16px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  tab-size: 2;
+}
+.syntax-editor::placeholder { color: var(--text-faint); }
