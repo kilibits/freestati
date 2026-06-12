@@ -9,7 +9,7 @@
  */
 import { dataStore } from '../stores/dataStore';
 import { outputStore } from '../stores/outputStore';
-import type { Analysis } from '../types/analysis';
+import type { Analysis, ChartData } from '../types/analysis';
 import type { Variable } from '../types/dataset';
 
 // ── Modal scaffold ───────────────────────────────────────────────────────────
@@ -208,7 +208,74 @@ const SPECS: Record<string, DialogSpec> = {
       { key: 'vars', label: 'Dependent List', multiple: true },
       { key: 'factor', label: 'Factor', multiple: false },
     ],
-    collect: (m) => collectFactor(m),
+    extras: (b) => {
+      const fs = document.createElement('div');
+      fs.className = 'dialog-options';
+      fs.innerHTML = `
+        <div class="dialog-options-label">Post Hoc Comparisons</div>
+        <label><input type="radio" name="posthoc" value="none" checked /> None</label>
+        <label><input type="radio" name="posthoc" value="lsd" /> LSD</label>
+        <label><input type="radio" name="posthoc" value="bonferroni" /> Bonferroni</label>`;
+      b.appendChild(fs);
+    },
+    collect: (m, b) => {
+      const base = collectFactor(m);
+      if (typeof base === 'string') return base;
+      const posthoc =
+        (b.querySelector('input[name="posthoc"]:checked') as HTMLInputElement)?.value ?? 'none';
+      return { ...base, posthoc };
+    },
+  },
+  crosstabs: {
+    title: 'Crosstabs',
+    procedure: 'crosstabs',
+    slots: [
+      { key: 'row', label: 'Row', multiple: false },
+      { key: 'col', label: 'Column', multiple: false },
+    ],
+    collect: (m) => {
+      const row = m.values('row');
+      const col = m.values('col');
+      if (row.length !== 1 || col.length !== 1) return 'Select one row and one column variable.';
+      return { row: row[0], col: col[0] };
+    },
+  },
+  factor: {
+    title: 'Factor Analysis',
+    procedure: 'factor',
+    slots: [{ key: 'vars', label: 'Variables', multiple: true }],
+    extras: (b) => {
+      const fs = document.createElement('div');
+      fs.className = 'dialog-options';
+      fs.innerHTML = `
+        <div class="dialog-options-label">Rotation</div>
+        <label><input type="radio" name="rotation" value="none" checked /> None</label>
+        <label><input type="radio" name="rotation" value="varimax" /> Varimax</label>`;
+      const fixed = document.createElement('label');
+      fixed.className = 'dialog-field';
+      fixed.innerHTML = `<span>Fixed number of factors (blank = Kaiser)</span>`;
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.dataset['key'] = 'factors';
+      input.className = 'dialog-input';
+      fixed.appendChild(input);
+      fs.appendChild(fixed);
+      b.appendChild(fs);
+    },
+    collect: (m, b) => {
+      const vars = m.values('vars');
+      if (vars.length < 2) return 'Select at least two variables.';
+      const rotation =
+        (b.querySelector('input[name="rotation"]:checked') as HTMLInputElement)?.value ?? 'none';
+      const raw = (b.querySelector('[data-key="factors"]') as HTMLInputElement).value.trim();
+      const params: Record<string, unknown> = { vars, rotation };
+      if (raw !== '') {
+        const n = Number(raw);
+        if (!Number.isInteger(n) || n < 1) return 'Fixed number of factors must be a positive integer.';
+        params['factors'] = n;
+      }
+      return params;
+    },
   },
   kruskal_wallis: {
     title: 'K Independent Samples (Kruskal-Wallis)',
@@ -280,6 +347,97 @@ export function openProcedureDialog(procedure: string, onDone: () => void): void
     return;
   }
   openSpecDialog(spec, onDone);
+}
+
+// ── Chart dialogs (Graphs menu) ──────────────────────────────────────────────
+
+interface ChartSpec {
+  title: string;
+  kind: string;
+  slots: Slot[];
+  collect: (mover: VarMover) => Record<string, unknown> | string;
+}
+
+const CHART_SPECS: Record<string, ChartSpec> = {
+  histogram: {
+    title: 'Histogram',
+    kind: 'histogram',
+    slots: [{ key: 'var', label: 'Variable', multiple: false }],
+    collect: (m) => requireOne(m, 'var'),
+  },
+  bar: {
+    title: 'Bar Chart',
+    kind: 'bar',
+    slots: [{ key: 'var', label: 'Category Axis', multiple: false }],
+    collect: (m) => requireOne(m, 'var'),
+  },
+  scatter: {
+    title: 'Scatter Plot',
+    kind: 'scatter',
+    slots: [
+      { key: 'y', label: 'Y Axis', multiple: false },
+      { key: 'x', label: 'X Axis', multiple: false },
+    ],
+    collect: (m) => {
+      const x = m.values('x');
+      const y = m.values('y');
+      if (x.length !== 1 || y.length !== 1) return 'Select one X and one Y variable.';
+      return { x: x[0], y: y[0] };
+    },
+  },
+  box: {
+    title: 'Box Plot',
+    kind: 'box',
+    slots: [
+      { key: 'vars', label: 'Variable(s)', multiple: true },
+      { key: 'group', label: 'Category Axis (optional)', multiple: false },
+    ],
+    collect: (m) => {
+      const vars = m.values('vars');
+      if (vars.length === 0) return 'Select at least one variable.';
+      const group = m.values('group');
+      const params: Record<string, unknown> = { vars };
+      if (group.length === 1) params['group'] = group[0];
+      return params;
+    },
+  },
+};
+
+/** Open the chart dialog for `kind` (histogram/bar/scatter/box). */
+export function openChartDialog(kind: string, onDone: () => void): void {
+  if (!dataStore.get().loaded) {
+    alert('Open a dataset before drawing a chart.');
+    return;
+  }
+  const spec = CHART_SPECS[kind];
+  if (!spec) {
+    alert(`Chart not available: ${kind}`);
+    return;
+  }
+  const modal = createModal(spec.title);
+  const mover = new VarMover(modal.body, dataStore.get().variables, spec.slots);
+  modal.onOk(async () => {
+    const params = spec.collect(mover);
+    if (typeof params === 'string') {
+      alert(params);
+      return false;
+    }
+    try {
+      const chart = await window.electron.analysis.chart(spec.kind, params);
+      outputStore.appendChart(chart as ChartData);
+      onDone();
+      return true;
+    } catch (err) {
+      alert(`Chart failed:\n${err}`);
+      return false;
+    }
+  });
+}
+
+function requireOne(m: VarMover, key: string): Record<string, unknown> | string {
+  const v = m.values(key);
+  if (v.length !== 1) return 'Select one variable.';
+  return { [key]: v[0] };
 }
 
 function openSpecDialog(spec: DialogSpec, onDone: () => void): void {
@@ -412,7 +570,7 @@ async function runProcedure(
 ): Promise<boolean> {
   try {
     const result = await window.electron.analysis.run(procedure, params);
-    outputStore.append(result as Analysis);
+    outputStore.appendAnalysis(result as Analysis);
     onDone();
     return true;
   } catch (err) {

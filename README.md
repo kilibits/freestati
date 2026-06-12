@@ -8,11 +8,16 @@ alongside `.tsv` and `.csv`.
 ## Features
 
 - **SPSS-style data editor** — Data View and Variable View with inline editing
-- **Statistical procedures** — Descriptives, Frequencies, t-tests (one-sample,
-  independent, paired), one-way ANOVA, correlation (Pearson/Spearman), linear
-  regression, and nonparametric tests (Mann-Whitney U, Wilcoxon, Kruskal-Wallis,
-  chi-square), all computed natively in Rust
-- **Output viewer** — an SPSS-style results pane that accumulates procedure tables
+- **Statistical procedures** — Descriptives, Frequencies, Crosstabs (chi-square,
+  Cramér's V), t-tests (one-sample, independent with Levene's test, paired),
+  one-way ANOVA with post-hoc (LSD/Bonferroni), correlation (Pearson/Spearman),
+  linear regression, factor analysis (PCA with varimax), and nonparametric tests
+  (Mann-Whitney U, Wilcoxon, Kruskal-Wallis, chi-square) — all computed natively
+  in Rust with no external stats dependency
+- **Charts** — histogram, bar, scatter (with fit line), and box plots, drawn as
+  dependency-free SVG from engine-side aggregates
+- **Output viewer** — an SPSS-style results pane that accumulates tables and
+  charts, with per-table copy/transpose and HTML export of the whole session
 - **File Explorer sidebar** — open a whole folder and load datasets on demand
 - **Virtualized grid** — AG Grid infinite row model scrolls millions of rows without
   loading them all into the WebView
@@ -134,7 +139,7 @@ with real assets before shipping).
 ```
 src/renderer/              WebView UI
 ├── components/            App, DataView, VariableView, OutputView, FileExplorer,
-│                          StatusBar, dialogs (analysis variable pickers)
+│                          StatusBar, dialogs (variable pickers), charts (SVG)
 ├── stores/                dataStore (dataset state) · outputStore (results)
 ├── types/                 dataset.ts · analysis.ts (result tables)
 ├── bridge.ts              window.electron shim over Tauri invoke/events/dialog
@@ -153,9 +158,8 @@ scripts/build-renderer.mjs esbuild bundler
 ## Roadmap
 
 - Restore `.xlsx` / `.dta` / `.sas7bdat` reading and `.sav` writing in the Rust engine
-- More procedures (crosstabs, factor analysis) and options (Levene's test, post-hoc)
-- Charts (histogram, bar, scatter, box plot)
-- Richer output viewer — pivot tables, export, copy to clipboard
+- More procedures (reliability, GLM) and options (Tukey HSD, effect sizes, CIs)
+- More chart types (line, clustered bar) and chart export to PNG/SVG
 - Tauri auto-updater
 
 ## License

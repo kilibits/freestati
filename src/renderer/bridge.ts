@@ -79,10 +79,20 @@ const electron = {
       invoke('update_cell', { row, col, value }),
   },
 
-  // ── Statistical procedures ──────────────────────────────────────────────────
+  // ── Statistical procedures & charts ─────────────────────────────────────────
   analysis: {
     run: (procedure: string, params: Record<string, unknown>) =>
       invoke('run_analysis', { procedure, params }),
+    chart: (kind: string, params: Record<string, unknown>) =>
+      invoke('run_chart', { kind, params }),
+    async exportText(contents: string): Promise<string | null> {
+      const path = await saveDialog({
+        filters: [{ name: 'HTML', extensions: ['html'] }],
+      });
+      if (!path) return null;
+      await invoke('save_text_file', { path, contents });
+      return path;
+    },
   },
 
   // ── Generic command pass-through (e.g. python.execute('new_dataset')) ───────

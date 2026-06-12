@@ -4,7 +4,7 @@ import { FileExplorer } from './FileExplorer';
 import { OutputView } from './OutputView';
 import { StatusBar } from './StatusBar';
 import { VariableView } from './VariableView';
-import { openProcedureDialog } from './dialogs';
+import { openChartDialog, openProcedureDialog } from './dialogs';
 
 type ActiveView = 'data' | 'variable' | 'output';
 
@@ -12,17 +12,22 @@ type ActiveView = 'data' | 'variable' | 'output';
 const ANALYZE_PROCEDURES = [
   'frequencies',
   'descriptives',
+  'crosstabs',
   'ttest_one_sample',
   'ttest_independent',
   'ttest_paired',
   'anova_oneway',
   'correlate',
   'regression_linear',
+  'factor',
   'mann_whitney',
   'wilcoxon',
   'kruskal_wallis',
   'chi_square',
 ];
+
+/** Charts wired to "menu:graph:<kind>" events from the native menu. */
+const GRAPH_KINDS = ['histogram', 'bar', 'scatter', 'box'];
 
 export class App {
   private dataView = new DataView();
@@ -51,13 +56,15 @@ export class App {
   // ── Analyze menu ────────────────────────────────────────────────────────────
 
   private bindAnalyzeMenu(): void {
+    const showOutput = () => {
+      this.switchView('output');
+      this.outputView.scrollToBottom();
+    };
     ANALYZE_PROCEDURES.forEach((proc) => {
-      window.electron.menu.on(`menu:analyze:${proc}`, () =>
-        openProcedureDialog(proc, () => {
-          this.switchView('output');
-          this.outputView.scrollToBottom();
-        }),
-      );
+      window.electron.menu.on(`menu:analyze:${proc}`, () => openProcedureDialog(proc, showOutput));
+    });
+    GRAPH_KINDS.forEach((kind) => {
+      window.electron.menu.on(`menu:graph:${kind}`, () => openChartDialog(kind, showOutput));
     });
   }
 

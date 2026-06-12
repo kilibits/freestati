@@ -61,6 +61,18 @@ pub struct Analysis {
     pub tables: Vec<OutTable>,
 }
 
+/// Computed chart data for the renderer's SVG charts. `payload` is kind-specific
+/// (histogram bins, bar categories, scatter points, or box-plot summaries).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChartData {
+    pub title: String,
+    pub kind: String,
+    pub x_label: String,
+    pub y_label: String,
+    pub payload: JsonValue,
+}
+
 type SResult<T> = Result<T, String>;
 
 // ── Cell helpers ─────────────────────────────────────────────────────────────
@@ -423,9 +435,9 @@ fn t_sig_2tailed(t: f64, df: f64) -> f64 {
     betai(df / 2.0, 0.5, df / (df + t * t))
 }
 
-/// Upper-tail p-value for F(df1, df2).
+/// Upper-tail p-value for F(df1, df2). F = 0 yields p = 1.
 fn f_sig(f: f64, df1: f64, df2: f64) -> f64 {
-    if f <= 0.0 || df1 <= 0.0 || df2 <= 0.0 {
+    if df1 <= 0.0 || df2 <= 0.0 || f < 0.0 || !f.is_finite() {
         return f64::NAN;
     }
     betai(df2 / 2.0, df1 / 2.0, df2 / (df2 + df1 * f))
@@ -478,9 +490,21 @@ impl Engine {
                 &p_str(params, "group2")?,
             ),
             "ttest_paired" => self.ttest_paired(df, &pairs(params)?),
-            "anova_oneway" => {
-                self.anova_oneway(df, &p_strs(params, "vars")?, &p_str(params, "factor")?)
+            "anova_oneway" => self.anova_oneway(
+                df,
+                &p_strs(params, "vars")?,
+                &p_str(params, "factor")?,
+                &p_str_opt(params, "posthoc").unwrap_or_else(|| "none".into()),
+            ),
+            "crosstabs" => {
+                self.crosstabs(df, &p_str(params, "row")?, &p_str(params, "col")?)
             }
+            "factor" => self.factor(
+                df,
+                &p_strs(params, "vars")?,
+                p_str_opt(params, "rotation").as_deref().unwrap_or("none"),
+                params.get("factors").and_then(|v| v.as_u64()).map(|n| n as usize),
+            ),
             "correlate" => self.correlate(
                 df,
                 &p_strs(params, "vars")?,
@@ -698,6 +722,11 @@ impl Engine {
             "Group Statistics",
             vec!["", group, "N", "Mean", "Std. Deviation", "Std. Error Mean"],
         );
+        let mut levene = OutTable::new(
+            "Levene's Test for Equality of Variances",
+            vec!["", "F", "Sig."],
+        )
+        .footnote("Based on absolute deviations from group means.");
         let mut test = OutTable::new(
             "Independent Samples Test",
             vec![
@@ -732,6 +761,10 @@ impl Engine {
             }
             let da = describe(&a);
             let db = describe(&b);
+
+            // Levene's test: one-way ANOVA on |xᵢⱼ − group meanᵢ|.
+            let (lf, lsig) = levene_two(&a, &b, da.mean, db.mean);
+            levene.rows.push(vec![text(self.display(v)), num(lf), num(lsig)]);
             stats.rows.push(vec![
                 text(self.display(v)),
                 text(g1),
@@ -786,7 +819,7 @@ impl Engine {
         }
         Ok(Analysis {
             title: "Independent-Samples T Test".into(),
-            tables: vec![stats, test],
+            tables: vec![stats, levene, test],
         })
     }
 
@@ -858,22 +891,26 @@ impl Engine {
         })
     }
 
-    fn anova_oneway(&self, df: &DataFrame, vars: &[String], factor: &str) -> SResult<Analysis> {
+    fn anova_oneway(
+        &self,
+        df: &DataFrame,
+        vars: &[String],
+        factor: &str,
+        posthoc: &str,
+    ) -> SResult<Analysis> {
         let labels = col_labels(df, factor)?;
         let mut tables = Vec::new();
         for v in vars {
             let xs = col_opt(df, v)?;
-            // Group values by factor level.
-            let mut groups: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+            // Group values by factor level (sorted by level for a stable order).
+            let mut grouped: BTreeMap<String, Vec<f64>> = BTreeMap::new();
             for (i, lab) in labels.iter().enumerate() {
                 if let (Some(l), Some(val)) = (lab, xs[i]) {
-                    groups.entry(l.clone()).or_default().push(val);
+                    grouped.entry(l.clone()).or_default().push(val);
                 }
             }
-            let groups: Vec<Vec<f64>> = groups
-                .into_values()
-                .filter(|g| !g.is_empty())
-                .collect();
+            let level_names: Vec<String> = grouped.keys().cloned().collect();
+            let groups: Vec<Vec<f64>> = grouped.into_values().collect();
             if groups.len() < 2 {
                 return Err(format!("'{factor}' must have at least 2 groups for '{v}'"));
             }
@@ -928,11 +965,78 @@ impl Engine {
                 JsonValue::Null,
             ]);
             tables.push(t);
+
+            if !posthoc.eq_ignore_ascii_case("none") {
+                tables.push(self.posthoc_table(
+                    &self.display(v),
+                    &level_names,
+                    &groups,
+                    ms_within,
+                    df_within,
+                    posthoc,
+                )?);
+            }
         }
         Ok(Analysis {
             title: "One-Way ANOVA".into(),
             tables,
         })
+    }
+
+    /// Post-hoc pairwise comparisons (LSD or Bonferroni) using the pooled
+    /// within-groups variance — both rest on the t distribution.
+    fn posthoc_table(
+        &self,
+        dep: &str,
+        levels: &[String],
+        groups: &[Vec<f64>],
+        ms_within: f64,
+        df_within: f64,
+        method: &str,
+    ) -> SResult<OutTable> {
+        let bonferroni = method.eq_ignore_ascii_case("bonferroni");
+        let method_label = if bonferroni { "Bonferroni" } else { "LSD" };
+        let means: Vec<f64> = groups
+            .iter()
+            .map(|g| g.iter().sum::<f64>() / g.len() as f64)
+            .collect();
+        let k = groups.len();
+        let n_comparisons = (k * (k - 1) / 2) as f64;
+
+        let mut t = OutTable::new(
+            format!("Multiple Comparisons — {dep} ({method_label})"),
+            vec![
+                "(I) Group",
+                "(J) Group",
+                "Mean Difference (I-J)",
+                "Std. Error",
+                "Sig.",
+            ],
+        );
+        for i in 0..k {
+            for j in 0..k {
+                if i == j {
+                    continue;
+                }
+                let ni = groups[i].len() as f64;
+                let nj = groups[j].len() as f64;
+                let diff = means[i] - means[j];
+                let se = (ms_within * (1.0 / ni + 1.0 / nj)).sqrt();
+                let tstat = diff / se;
+                let mut p = t_sig_2tailed(tstat, df_within);
+                if bonferroni {
+                    p = (p * n_comparisons).min(1.0);
+                }
+                t.rows.push(vec![
+                    text(&levels[i]),
+                    text(&levels[j]),
+                    num(diff),
+                    num(se),
+                    num(p),
+                ]);
+            }
+        }
+        Ok(t)
     }
 
     // ── Correlation & regression ─────────────────────────────────────────────
@@ -1419,9 +1523,627 @@ impl Engine {
             tables,
         })
     }
+
+    // ── Crosstabs ─────────────────────────────────────────────────────────────
+
+    fn crosstabs(&self, df: &DataFrame, row: &str, col: &str) -> SResult<Analysis> {
+        let row_labels = col_labels(df, row)?;
+        let col_labels_v = col_labels(df, col)?;
+        let row_vl = self.var_meta.get(row).and_then(|m| m.value_labels.clone());
+        let col_vl = self.var_meta.get(col).and_then(|m| m.value_labels.clone());
+
+        // Distinct, ordered categories for each variable.
+        let row_cats = ordered_levels(&row_labels);
+        let col_cats = ordered_levels(&col_labels_v);
+        if row_cats.is_empty() || col_cats.is_empty() {
+            return Err("Both variables need at least one category".into());
+        }
+
+        // Observed counts O[r][c].
+        let mut obs = vec![vec![0usize; col_cats.len()]; row_cats.len()];
+        let mut total = 0usize;
+        for i in 0..row_labels.len() {
+            if let (Some(r), Some(c)) = (&row_labels[i], &col_labels_v[i]) {
+                let ri = row_cats.iter().position(|x| x == r).unwrap();
+                let ci = col_cats.iter().position(|x| x == c).unwrap();
+                obs[ri][ci] += 1;
+                total += 1;
+            }
+        }
+        let row_tot: Vec<usize> = obs.iter().map(|r| r.iter().sum()).collect();
+        let col_tot: Vec<usize> = (0..col_cats.len())
+            .map(|c| obs.iter().map(|r| r[c]).sum())
+            .collect();
+
+        // Crosstabulation table (counts with margins).
+        let label_for = |raw: &str, vl: &Option<std::collections::HashMap<String, String>>| {
+            vl.as_ref()
+                .and_then(|m| m.get(raw).cloned())
+                .unwrap_or_else(|| raw.to_string())
+        };
+        let mut headers = vec![format!("{} ╲ {}", self.display(row), self.display(col))];
+        headers.extend(col_cats.iter().map(|c| label_for(c, &col_vl)));
+        headers.push("Total".into());
+        let header_refs: Vec<&str> = headers.iter().map(|s| s.as_str()).collect();
+        let mut xt = OutTable::new("Crosstabulation (Count)", header_refs);
+        for (ri, rc) in row_cats.iter().enumerate() {
+            let mut cells = vec![text(label_for(rc, &row_vl))];
+            for ci in 0..col_cats.len() {
+                cells.push(int(obs[ri][ci] as i64));
+            }
+            cells.push(int(row_tot[ri] as i64));
+            xt.rows.push(cells);
+        }
+        let mut total_row = vec![text("Total")];
+        for ci in 0..col_cats.len() {
+            total_row.push(int(col_tot[ci] as i64));
+        }
+        total_row.push(int(total as i64));
+        xt.rows.push(total_row);
+
+        // Chi-square test of independence + likelihood ratio + Cramér's V.
+        let mut chi2 = 0.0;
+        let mut g2 = 0.0;
+        for ri in 0..row_cats.len() {
+            for ci in 0..col_cats.len() {
+                let e = row_tot[ri] as f64 * col_tot[ci] as f64 / total as f64;
+                let o = obs[ri][ci] as f64;
+                if e > 0.0 {
+                    chi2 += (o - e).powi(2) / e;
+                    if o > 0.0 {
+                        g2 += 2.0 * o * (o / e).ln();
+                    }
+                }
+            }
+        }
+        let dfree = (row_cats.len() as f64 - 1.0) * (col_cats.len() as f64 - 1.0);
+        let min_dim = (row_cats.len().min(col_cats.len()) as f64 - 1.0).max(1.0);
+        let cramers_v = (chi2 / (total as f64 * min_dim)).sqrt();
+
+        let mut test = OutTable::new("Chi-Square Tests", vec!["", "Value", "df", "Asymp. Sig. (2-sided)"]);
+        test.rows.push(vec![
+            text("Pearson Chi-Square"),
+            num(chi2),
+            num(dfree),
+            num(chi2_sig(chi2, dfree)),
+        ]);
+        test.rows.push(vec![
+            text("Likelihood Ratio"),
+            num(g2),
+            num(dfree),
+            num(chi2_sig(g2, dfree)),
+        ]);
+        test.rows.push(vec![
+            text("N of Valid Cases"),
+            int(total as i64),
+            JsonValue::Null,
+            JsonValue::Null,
+        ]);
+
+        let mut measures = OutTable::new("Symmetric Measures", vec!["", "Value"]);
+        measures.rows.push(vec![text("Cramér's V"), num(cramers_v)]);
+
+        Ok(Analysis {
+            title: format!("Crosstabs — {} × {}", self.display(row), self.display(col)),
+            tables: vec![xt, test, measures],
+        })
+    }
+
+    // ── Factor analysis (principal components) ────────────────────────────────
+
+    fn factor(
+        &self,
+        df: &DataFrame,
+        vars: &[String],
+        rotation: &str,
+        fixed_factors: Option<usize>,
+    ) -> SResult<Analysis> {
+        let p = vars.len();
+        if p < 2 {
+            return Err("Factor analysis needs at least 2 variables".into());
+        }
+        // Listwise-deleted data matrix.
+        let cols: Vec<Vec<Option<f64>>> =
+            vars.iter().map(|v| col_opt(df, v)).collect::<SResult<_>>()?;
+        let nrows = df.height();
+        let mut rows: Vec<Vec<f64>> = Vec::new();
+        for i in 0..nrows {
+            if cols.iter().all(|c| c[i].is_some()) {
+                rows.push(cols.iter().map(|c| c[i].unwrap()).collect());
+            }
+        }
+        let n = rows.len();
+        if n <= p {
+            return Err("Not enough complete cases for the number of variables".into());
+        }
+
+        // Correlation matrix R (p × p).
+        let mut means = vec![0.0; p];
+        for r in &rows {
+            for j in 0..p {
+                means[j] += r[j];
+            }
+        }
+        means.iter_mut().for_each(|m| *m /= n as f64);
+        let mut sd = vec![0.0; p];
+        for r in &rows {
+            for j in 0..p {
+                sd[j] += (r[j] - means[j]).powi(2);
+            }
+        }
+        sd.iter_mut().for_each(|s| *s = (*s / (n as f64 - 1.0)).sqrt());
+        let mut corr = vec![vec![0.0; p]; p];
+        for a in 0..p {
+            for b in 0..p {
+                let mut cov = 0.0;
+                for r in &rows {
+                    cov += (r[a] - means[a]) * (r[b] - means[b]);
+                }
+                cov /= n as f64 - 1.0;
+                corr[a][b] = if sd[a] > 0.0 && sd[b] > 0.0 {
+                    cov / (sd[a] * sd[b])
+                } else {
+                    0.0
+                };
+            }
+        }
+
+        // Eigen-decomposition (sorted descending).
+        let (eigvals, eigvecs) = jacobi_eigen(&corr);
+        let mut order: Vec<usize> = (0..p).collect();
+        order.sort_by(|&a, &b| eigvals[b].partial_cmp(&eigvals[a]).unwrap());
+
+        // Number of components: fixed count, else Kaiser (eigenvalue > 1).
+        let m = match fixed_factors {
+            Some(m) => m.clamp(1, p),
+            None => order.iter().filter(|&&i| eigvals[i] > 1.0).count().max(1),
+        };
+
+        // Unrotated loadings: a_ij = v_ij * sqrt(λ_j).
+        let mut loadings = vec![vec![0.0; m]; p]; // p vars × m components
+        for (cidx, &ei) in order.iter().take(m).enumerate() {
+            let scale = eigvals[ei].max(0.0).sqrt();
+            for var in 0..p {
+                loadings[var][cidx] = eigvecs[var][ei] * scale;
+            }
+        }
+
+        // Total variance explained.
+        let total_var = p as f64;
+        let mut variance = OutTable::new(
+            "Total Variance Explained",
+            vec!["Component", "Eigenvalue", "% of Variance", "Cumulative %"],
+        );
+        let mut cum = 0.0;
+        for (rank, &ei) in order.iter().enumerate() {
+            let pct = eigvals[ei] / total_var * 100.0;
+            cum += pct;
+            variance.rows.push(vec![
+                int(rank as i64 + 1),
+                num(eigvals[ei]),
+                num(pct),
+                num(cum),
+            ]);
+        }
+
+        // Communalities (PCA: initial = 1, extraction = Σ loadings²).
+        let mut comm = OutTable::new("Communalities", vec!["", "Initial", "Extraction"]);
+        for var in 0..p {
+            let extraction: f64 = loadings[var].iter().map(|l| l * l).sum();
+            comm.rows.push(vec![text(self.display(&vars[var])), num(1.0), num(extraction)]);
+        }
+
+        let mut tables = vec![comm, variance];
+        tables.push(self.loading_table("Component Matrix", vars, &loadings, m));
+
+        // Optional varimax rotation.
+        if rotation.eq_ignore_ascii_case("varimax") && m > 1 {
+            let rotated = varimax(&loadings);
+            tables.push(self.loading_table("Rotated Component Matrix (Varimax)", vars, &rotated, m));
+        }
+
+        Ok(Analysis {
+            title: "Factor Analysis (Principal Components)".into(),
+            tables,
+        })
+    }
+
+    fn loading_table(
+        &self,
+        title: &str,
+        vars: &[String],
+        loadings: &[Vec<f64>],
+        m: usize,
+    ) -> OutTable {
+        let mut headers = vec!["".to_string()];
+        for c in 0..m {
+            headers.push(format!("Component {}", c + 1));
+        }
+        let refs: Vec<&str> = headers.iter().map(|s| s.as_str()).collect();
+        let mut t = OutTable::new(title, refs);
+        for (var, row) in loadings.iter().enumerate() {
+            let mut cells = vec![text(self.display(&vars[var]))];
+            cells.extend(row.iter().map(|&l| num(l)));
+            t.rows.push(cells);
+        }
+        t
+    }
+
+    // ── Charts ────────────────────────────────────────────────────────────────
+
+    /// Compute chart data for the Graphs menu. Aggregation happens here so the
+    /// renderer only draws (and large datasets don't cross the boundary raw).
+    pub fn run_chart(&self, kind: &str, params: &JsonValue) -> SResult<ChartData> {
+        let df = self.df.as_ref().ok_or("No dataset loaded")?;
+        match kind {
+            "histogram" => self.chart_histogram(df, &p_str(params, "var")?),
+            "bar" => self.chart_bar(df, &p_str(params, "var")?),
+            "scatter" => {
+                self.chart_scatter(df, &p_str(params, "x")?, &p_str(params, "y")?)
+            }
+            "box" => self.chart_box(
+                df,
+                &p_strs(params, "vars")?,
+                p_str_opt(params, "group").as_deref(),
+            ),
+            other => Err(format!("Unknown chart: {other}")),
+        }
+    }
+
+    fn chart_histogram(&self, df: &DataFrame, var: &str) -> SResult<ChartData> {
+        let x = col_valid(df, var)?;
+        if x.len() < 2 {
+            return Err(format!("'{var}' has too few valid values"));
+        }
+        let d = describe(&x);
+        let (min, max) = (d.min, d.max);
+        // Sturges' rule, clamped to a sensible range.
+        let bin_count = ((x.len() as f64).log2().ceil() as usize + 1).clamp(5, 40);
+        let width = ((max - min) / bin_count as f64).max(f64::MIN_POSITIVE);
+        let mut counts = vec![0usize; bin_count];
+        for &v in &x {
+            let mut b = ((v - min) / width).floor() as usize;
+            if b >= bin_count {
+                b = bin_count - 1;
+            }
+            counts[b] += 1;
+        }
+        let bins: Vec<JsonValue> = counts
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| {
+                serde_json::json!({
+                    "x0": min + i as f64 * width,
+                    "x1": min + (i as f64 + 1.0) * width,
+                    "count": c,
+                })
+            })
+            .collect();
+        Ok(ChartData {
+            title: format!("Histogram of {}", self.display(var)),
+            kind: "histogram".into(),
+            x_label: self.display(var),
+            y_label: "Frequency".into(),
+            payload: serde_json::json!({
+                "bins": bins, "mean": num(d.mean), "sd": num(d.sd), "n": d.n,
+            }),
+        })
+    }
+
+    fn chart_bar(&self, df: &DataFrame, var: &str) -> SResult<ChartData> {
+        let labels = col_labels(df, var)?;
+        let value_labels = self.var_meta.get(var).and_then(|m| m.value_labels.clone());
+        let mut counts: BTreeMap<OrderKey, usize> = BTreeMap::new();
+        for l in labels.iter().flatten() {
+            *counts.entry(OrderKey::from(l.as_str())).or_insert(0) += 1;
+        }
+        let categories: Vec<JsonValue> = counts
+            .iter()
+            .map(|(k, &c)| {
+                let raw = k.label();
+                let shown = value_labels
+                    .as_ref()
+                    .and_then(|m| m.get(&raw).cloned())
+                    .unwrap_or(raw);
+                serde_json::json!({ "label": shown, "count": c })
+            })
+            .collect();
+        Ok(ChartData {
+            title: format!("Bar Chart of {}", self.display(var)),
+            kind: "bar".into(),
+            x_label: self.display(var),
+            y_label: "Count".into(),
+            payload: serde_json::json!({ "categories": categories }),
+        })
+    }
+
+    fn chart_scatter(&self, df: &DataFrame, x: &str, y: &str) -> SResult<ChartData> {
+        let xs = col_opt(df, x)?;
+        let ys = col_opt(df, y)?;
+        let mut xv = Vec::new();
+        let mut yv = Vec::new();
+        for i in 0..xs.len() {
+            if let (Some(a), Some(b)) = (xs[i], ys[i]) {
+                xv.push(a);
+                yv.push(b);
+            }
+        }
+        if xv.len() < 2 {
+            return Err("Need at least 2 complete (x, y) pairs".into());
+        }
+        // Cap points crossing the boundary; even-stride sample if very large.
+        const CAP: usize = 5000;
+        let stride = (xv.len() / CAP).max(1);
+        let points: Vec<JsonValue> = (0..xv.len())
+            .step_by(stride)
+            .map(|i| serde_json::json!([xv[i], yv[i]]))
+            .collect();
+        // Least-squares fit line for an overlay.
+        let r = pearson(&xv, &yv);
+        let dx = describe(&xv);
+        let dy = describe(&yv);
+        let slope = r * dy.sd / dx.sd;
+        let intercept = dy.mean - slope * dx.mean;
+        Ok(ChartData {
+            title: format!("{} vs {}", self.display(y), self.display(x)),
+            kind: "scatter".into(),
+            x_label: self.display(x),
+            y_label: self.display(y),
+            payload: serde_json::json!({
+                "points": points,
+                "fit": { "slope": num(slope), "intercept": num(intercept) },
+                "r": num(r),
+                "xMin": dx.min, "xMax": dx.max,
+            }),
+        })
+    }
+
+    fn chart_box(
+        &self,
+        df: &DataFrame,
+        vars: &[String],
+        group: Option<&str>,
+    ) -> SResult<ChartData> {
+        // Each "box" is either one variable, or one (variable × group level).
+        let mut boxes: Vec<JsonValue> = Vec::new();
+        let group_labels = match group {
+            Some(g) => Some(col_labels(df, g)?),
+            None => None,
+        };
+        for v in vars {
+            let xs = col_opt(df, v)?;
+            match &group_labels {
+                None => {
+                    let data: Vec<f64> = xs.iter().flatten().copied().collect();
+                    if let Some(b) = box_summary(&self.display(v), &data) {
+                        boxes.push(b);
+                    }
+                }
+                Some(glab) => {
+                    let mut grouped: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+                    for (i, l) in glab.iter().enumerate() {
+                        if let (Some(l), Some(val)) = (l, xs[i]) {
+                            grouped.entry(l.clone()).or_default().push(val);
+                        }
+                    }
+                    for (lev, data) in grouped {
+                        let label = if vars.len() > 1 {
+                            format!("{} ({})", self.display(v), lev)
+                        } else {
+                            lev
+                        };
+                        if let Some(b) = box_summary(&label, &data) {
+                            boxes.push(b);
+                        }
+                    }
+                }
+            }
+        }
+        if boxes.is_empty() {
+            return Err("No valid data to plot".into());
+        }
+        let title = match group {
+            Some(g) => format!("Boxplot by {}", self.display(g)),
+            None => "Boxplot".into(),
+        };
+        Ok(ChartData {
+            title,
+            kind: "box".into(),
+            x_label: String::new(),
+            y_label: "Value".into(),
+            payload: serde_json::json!({ "boxes": boxes }),
+        })
+    }
 }
 
 // ── Shared numeric helpers ───────────────────────────────────────────────────
+
+/// Levene's test for two groups: one-way ANOVA on absolute deviations from each
+/// group's mean. Returns (F, Sig) with df1 = 1, df2 = n1 + n2 − 2.
+fn levene_two(a: &[f64], b: &[f64], mean_a: f64, mean_b: f64) -> (f64, f64) {
+    let za: Vec<f64> = a.iter().map(|x| (x - mean_a).abs()).collect();
+    let zb: Vec<f64> = b.iter().map(|x| (x - mean_b).abs()).collect();
+    let (n1, n2) = (za.len() as f64, zb.len() as f64);
+    let mza = za.iter().sum::<f64>() / n1;
+    let mzb = zb.iter().sum::<f64>() / n2;
+    let grand = (za.iter().sum::<f64>() + zb.iter().sum::<f64>()) / (n1 + n2);
+    let ss_between = n1 * (mza - grand).powi(2) + n2 * (mzb - grand).powi(2);
+    let ss_within: f64 = za.iter().map(|z| (z - mza).powi(2)).sum::<f64>()
+        + zb.iter().map(|z| (z - mzb).powi(2)).sum::<f64>();
+    let df1 = 1.0;
+    let df2 = n1 + n2 - 2.0;
+    if ss_within == 0.0 {
+        return (f64::NAN, f64::NAN);
+    }
+    let f = (ss_between / df1) / (ss_within / df2);
+    (f, f_sig(f, df1, df2))
+}
+
+/// Linear-interpolation quantile (type 7) of an already-sorted slice.
+fn quantile_sorted(sorted: &[f64], q: f64) -> f64 {
+    let n = sorted.len();
+    if n == 0 {
+        return f64::NAN;
+    }
+    if n == 1 {
+        return sorted[0];
+    }
+    let pos = q * (n as f64 - 1.0);
+    let lo = pos.floor() as usize;
+    let hi = pos.ceil() as usize;
+    let frac = pos - lo as f64;
+    sorted[lo] + frac * (sorted[hi] - sorted[lo])
+}
+
+/// Five-number summary + 1.5·IQR outliers for one box, as JSON. None if empty.
+fn box_summary(label: &str, data: &[f64]) -> Option<JsonValue> {
+    if data.is_empty() {
+        return None;
+    }
+    let mut s = data.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let q1 = quantile_sorted(&s, 0.25);
+    let median = quantile_sorted(&s, 0.5);
+    let q3 = quantile_sorted(&s, 0.75);
+    let iqr = q3 - q1;
+    let lo_fence = q1 - 1.5 * iqr;
+    let hi_fence = q3 + 1.5 * iqr;
+    // Whiskers reach the most extreme non-outlier values.
+    let whisker_lo = s.iter().copied().find(|&v| v >= lo_fence).unwrap_or(s[0]);
+    let whisker_hi = s
+        .iter()
+        .rev()
+        .copied()
+        .find(|&v| v <= hi_fence)
+        .unwrap_or(s[s.len() - 1]);
+    let outliers: Vec<f64> = s
+        .iter()
+        .copied()
+        .filter(|&v| v < lo_fence || v > hi_fence)
+        .collect();
+    Some(serde_json::json!({
+        "label": label,
+        "min": whisker_lo,
+        "q1": q1,
+        "median": median,
+        "q3": q3,
+        "max": whisker_hi,
+        "outliers": outliers,
+        "n": data.len(),
+    }))
+}
+
+/// Distinct category labels in canonical order (numeric values numerically,
+/// strings lexically, numbers before strings) — shared by crosstabs.
+fn ordered_levels(labels: &[Option<String>]) -> Vec<String> {
+    let mut set: std::collections::BTreeSet<OrderKey> = std::collections::BTreeSet::new();
+    for l in labels.iter().flatten() {
+        set.insert(OrderKey::from(l.as_str()));
+    }
+    set.into_iter().map(|k| k.label()).collect()
+}
+
+/// Jacobi eigenvalue algorithm for a real symmetric matrix. Returns
+/// (eigenvalues, eigenvectors) where eigenvectors[i][j] is the i-th component of
+/// the j-th eigenvector (columns are eigenvectors).
+fn jacobi_eigen(input: &[Vec<f64>]) -> (Vec<f64>, Vec<Vec<f64>>) {
+    let n = input.len();
+    let mut a = input.to_vec();
+    let mut v = (0..n)
+        .map(|i| (0..n).map(|j| if i == j { 1.0 } else { 0.0 }).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+
+    for _sweep in 0..100 {
+        // Sum of off-diagonal magnitudes; stop when negligible.
+        let mut off = 0.0;
+        for i in 0..n {
+            for j in (i + 1)..n {
+                off += a[i][j].abs();
+            }
+        }
+        if off < 1e-12 {
+            break;
+        }
+        for p in 0..n {
+            for q in (p + 1)..n {
+                if a[p][q].abs() < 1e-300 {
+                    continue;
+                }
+                let theta = (a[q][q] - a[p][p]) / (2.0 * a[p][q]);
+                let t = theta.signum() / (theta.abs() + (theta * theta + 1.0).sqrt());
+                let c = 1.0 / (t * t + 1.0).sqrt();
+                let s = t * c;
+                // Rotate A.
+                for i in 0..n {
+                    let aip = a[i][p];
+                    let aiq = a[i][q];
+                    a[i][p] = c * aip - s * aiq;
+                    a[i][q] = s * aip + c * aiq;
+                }
+                for i in 0..n {
+                    let api = a[p][i];
+                    let aqi = a[q][i];
+                    a[p][i] = c * api - s * aqi;
+                    a[q][i] = s * api + c * aqi;
+                }
+                // Accumulate eigenvectors.
+                for i in 0..n {
+                    let vip = v[i][p];
+                    let viq = v[i][q];
+                    v[i][p] = c * vip - s * viq;
+                    v[i][q] = s * vip + c * viq;
+                }
+            }
+        }
+    }
+    let eigvals = (0..n).map(|i| a[i][i]).collect();
+    (eigvals, v)
+}
+
+/// Kaiser varimax rotation of a loadings matrix (p vars × m components).
+fn varimax(loadings: &[Vec<f64>]) -> Vec<Vec<f64>> {
+    let p = loadings.len();
+    let m = loadings[0].len();
+    let mut l = loadings.to_vec();
+    for _ in 0..50 {
+        let mut converged = true;
+        for c1 in 0..m {
+            for c2 in (c1 + 1)..m {
+                let (mut u_sum, mut v_sum, mut u2v2, mut uv2) = (0.0, 0.0, 0.0, 0.0);
+                for row in l.iter() {
+                    let x = row[c1];
+                    let y = row[c2];
+                    let u = x * x - y * y;
+                    let v = 2.0 * x * y;
+                    u_sum += u;
+                    v_sum += v;
+                    u2v2 += u * u - v * v;
+                    uv2 += 2.0 * u * v;
+                }
+                let num = uv2 - 2.0 * u_sum * v_sum / p as f64;
+                let den = u2v2 - (u_sum * u_sum - v_sum * v_sum) / p as f64;
+                if den.abs() < 1e-12 && num.abs() < 1e-12 {
+                    continue;
+                }
+                let angle = 0.25 * num.atan2(den);
+                if angle.abs() > 1e-6 {
+                    converged = false;
+                }
+                let (cos, sin) = (angle.cos(), angle.sin());
+                for row in l.iter_mut() {
+                    let x = row[c1];
+                    let y = row[c2];
+                    row[c1] = cos * x + sin * y;
+                    row[c2] = -sin * x + cos * y;
+                }
+            }
+        }
+        if converged {
+            break;
+        }
+    }
+    l
+}
 
 /// Pearson correlation of two equal-length slices.
 fn pearson(a: &[f64], b: &[f64]) -> f64 {
@@ -1669,6 +2391,60 @@ mod tests {
         run("wilcoxon", serde_json::json!({ "pairs": [["y", "x"]] }));
         run("kruskal_wallis", serde_json::json!({ "vars": ["y"], "factor": "grp" }));
         run("chi_square", serde_json::json!({ "vars": ["grp"] }));
+        run("crosstabs", serde_json::json!({ "row": "grp", "col": "x" }));
+        run(
+            "anova_oneway",
+            serde_json::json!({ "vars": ["y"], "factor": "grp", "posthoc": "bonferroni" }),
+        );
+        run("factor", serde_json::json!({ "vars": ["y", "x"], "rotation": "varimax" }));
+    }
+
+    #[test]
+    fn charts_run_without_panic() {
+        let eng = sample_engine();
+        eng.run_chart("histogram", &serde_json::json!({ "var": "y" })).unwrap();
+        eng.run_chart("bar", &serde_json::json!({ "var": "grp" })).unwrap();
+        eng.run_chart("scatter", &serde_json::json!({ "x": "x", "y": "y" }))
+            .unwrap();
+        eng.run_chart("box", &serde_json::json!({ "vars": ["y"], "group": "grp" }))
+            .unwrap();
+        eng.run_chart("box", &serde_json::json!({ "vars": ["y", "x"] })).unwrap();
+    }
+
+    #[test]
+    fn jacobi_recovers_eigenvalues() {
+        // [[2,0],[0,3]] → eigenvalues {2,3}, identity eigenvectors.
+        let (vals, _) = jacobi_eigen(&[vec![2.0, 0.0], vec![0.0, 3.0]]);
+        let mut v = vals.clone();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        close(v[0], 2.0, 1e-9);
+        close(v[1], 3.0, 1e-9);
+        // A 2×2 correlation-like matrix [[1,0.6],[0.6,1]] → eigenvalues 1.6, 0.4.
+        let (vals2, _) = jacobi_eigen(&[vec![1.0, 0.6], vec![0.6, 1.0]]);
+        let mut v2 = vals2.clone();
+        v2.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        close(v2[0], 0.4, 1e-9);
+        close(v2[1], 1.6, 1e-9);
+    }
+
+    #[test]
+    fn box_summary_quartiles() {
+        // 1..=9 → Q1=3, median=5, Q3=7 (type-7 interpolation).
+        let data: Vec<f64> = (1..=9).map(|i| i as f64).collect();
+        let b = box_summary("v", &data).unwrap();
+        close(b["q1"].as_f64().unwrap(), 3.0, 1e-9);
+        close(b["median"].as_f64().unwrap(), 5.0, 1e-9);
+        close(b["q3"].as_f64().unwrap(), 7.0, 1e-9);
+    }
+
+    #[test]
+    fn levene_equal_variances() {
+        // Two groups with identical spread → Levene F ≈ 0, large p.
+        let a = [1.0, 2.0, 3.0, 4.0, 5.0];
+        let b = [11.0, 12.0, 13.0, 14.0, 15.0];
+        let (f, sig) = levene_two(&a, &b, 3.0, 13.0);
+        close(f, 0.0, 1e-9);
+        assert!(sig > 0.99, "expected high p, got {sig}");
     }
 
     #[test]

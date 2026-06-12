@@ -1,10 +1,10 @@
-import type { Analysis } from '../types/analysis';
+import type { Analysis, ChartData, OutputItem } from '../types/analysis';
 
 type Listener = () => void;
 
-/** Accumulates analysis results for the Output viewer (newest appended last). */
+/** Accumulates analysis results and charts for the Output viewer. */
 class OutputStore {
-  private items: Analysis[] = [];
+  private items: OutputItem[] = [];
   private listeners = new Set<Listener>();
 
   subscribe(fn: Listener): () => void {
@@ -16,12 +16,17 @@ class OutputStore {
     this.listeners.forEach((fn) => fn());
   }
 
-  get(): readonly Analysis[] {
+  get(): readonly OutputItem[] {
     return this.items;
   }
 
-  append(result: Analysis): void {
-    this.items = [...this.items, result];
+  appendAnalysis(analysis: Analysis): void {
+    this.items = [...this.items, { kind: 'analysis', analysis }];
+    this.notify();
+  }
+
+  appendChart(chart: ChartData): void {
+    this.items = [...this.items, { kind: 'chart', chart }];
     this.notify();
   }
 

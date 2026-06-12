@@ -1,5 +1,5 @@
 import type { LoadResult, Variable } from './types/dataset';
-import type { Analysis } from './types/analysis';
+import type { Analysis, ChartData } from './types/analysis';
 
 // This file imports types, making it a module. To augment the global `Window`
 // from a module the declaration must live inside `declare global`.
@@ -26,6 +26,8 @@ declare global {
 
     analysis: {
       run(procedure: string, params: Record<string, unknown>): Promise<Analysis>;
+      chart(kind: string, params: Record<string, unknown>): Promise<ChartData>;
+      exportText(contents: string): Promise<string | null>;
     };
 
     fs: {

@@ -579,3 +579,45 @@ html, body, #app {
 .pairs-dialog { display: flex; flex-direction: column; gap: 10px; }
 .pairs-pickers { display: flex; gap: 10px; }
 .pairs-add { align-self: flex-start; }
+
+/* ── Output viewer: charts & table controls ────────────────────────────────── */
+.output-toolbar { gap: 8px; }
+.output-btn {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 4px 10px;
+  font-size: 11px;
+  cursor: pointer;
+  font-family: var(--font);
+}
+.output-btn:hover { background: var(--accent); border-color: var(--accent); }
+.output-table-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 5px;
+}
+.output-table-actions { display: flex; gap: 6px; }
+.output-mini-btn {
+  background: transparent;
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 7px;
+  font-size: 10px;
+  cursor: pointer;
+  font-family: var(--font);
+}
+.output-mini-btn:hover { color: var(--text); border-color: var(--accent); }
+.output-mini-btn.active { color: #fff; background: var(--accent); border-color: var(--accent); }
+.output-chart-host {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px;
+  display: inline-block;
+}
+.output-chart { display: block; }

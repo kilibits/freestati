@@ -155,6 +155,22 @@ fn run_analysis(
     state.lock().unwrap().run_analysis(&procedure, &params)
 }
 
+#[tauri::command]
+fn run_chart(
+    state: State<EngineState>,
+    kind: String,
+    params: JsonValue,
+) -> Result<stats::ChartData, String> {
+    state.lock().unwrap().run_chart(&kind, &params)
+}
+
+/// Write text (e.g. exported output HTML) to a path chosen via the save dialog.
+#[tauri::command]
+fn save_text_file(path: String, contents: String) -> Result<JsonValue, String> {
+    std::fs::write(&path, contents).map_err(|e| e.to_string())?;
+    Ok(json!({ "ok": true, "path": path }))
+}
+
 // ── Native menu ─────────────────────────────────────────────────────────────
 
 fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
@@ -165,8 +181,6 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         }
         b.build(app)
     };
-    let disabled = |id: &str, label: &str| MenuItemBuilder::with_id(id, label).enabled(false).build(app);
-
     // File
     let file = SubmenuBuilder::new(app, "File")
         .item(&mi("menu:file:new", "New Dataset", Some("CmdOrCtrl+N"))?)
@@ -208,19 +222,21 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let analyze = SubmenuBuilder::new(app, "Analyze")
         .item(&mi("menu:analyze:frequencies", "Frequencies…", None)?)
         .item(&mi("menu:analyze:descriptives", "Descriptives…", None)?)
+        .item(&mi("menu:analyze:crosstabs", "Crosstabs…", None)?)
         .separator()
         .item(&compare_means)
         .item(&mi("menu:analyze:correlate", "Correlate…", None)?)
         .item(&mi("menu:analyze:regression_linear", "Linear Regression…", None)?)
+        .item(&mi("menu:analyze:factor", "Factor Analysis…", None)?)
         .item(&nonparametric)
         .build()?;
 
-    // Graphs (placeholders)
+    // Graphs — emit "menu:graph:<kind>" to the renderer, which opens a dialog.
     let graphs = SubmenuBuilder::new(app, "Graphs")
-        .item(&disabled("gr:hist", "Histogram…")?)
-        .item(&disabled("gr:bar", "Bar Chart…")?)
-        .item(&disabled("gr:scatter", "Scatter Plot…")?)
-        .item(&disabled("gr:box", "Box Plot…")?)
+        .item(&mi("menu:graph:histogram", "Histogram…", None)?)
+        .item(&mi("menu:graph:bar", "Bar Chart…", None)?)
+        .item(&mi("menu:graph:scatter", "Scatter Plot…", None)?)
+        .item(&mi("menu:graph:box", "Box Plot…", None)?)
         .build()?;
 
     // View
@@ -288,6 +304,8 @@ pub fn run() {
             update_cell,
             save_file,
             run_analysis,
+            run_chart,
+            save_text_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running FreeStati");

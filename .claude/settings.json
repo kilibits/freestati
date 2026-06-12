@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo check)",
+      "Bash(npm run lint)",
+      "Bash(cargo test)",
+      "Bash(cargo test *)",
+      "Bash(cargo info *)"
+    ]
+  }
+}
