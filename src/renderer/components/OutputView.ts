@@ -72,7 +72,9 @@ export class OutputView {
     const block = document.createElement('div');
     block.className = 'output-block';
     block.appendChild(heading(analysis.title));
-    analysis.tables.forEach((table) => block.appendChild(this.renderTableWrap(table)));
+    if (analysis.tables) {
+      analysis.tables.forEach((table) => block.appendChild(this.renderTableWrap(table)));
+    }
     return block;
   }
 
@@ -207,7 +209,9 @@ export class OutputView {
     outputStore.get().forEach((item) => {
       if (item.kind === 'analysis') {
         parts.push(item.analysis.title);
-        item.analysis.tables.forEach((t) => parts.push(`${t.title}\n${tableToTsv(t, false)}`));
+        if (item.analysis.tables) {
+          item.analysis.tables.forEach((t) => parts.push(`${t.title}\n${tableToTsv(t, false)}`));
+        }
       } else {
         parts.push(item.chart.title);
       }

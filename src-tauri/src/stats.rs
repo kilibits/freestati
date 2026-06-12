@@ -18,8 +18,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use ndarray::{Array1, Array2};
 use polars::prelude::*;
-use serde::Serialize;
+use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::engine::Engine;
@@ -28,7 +30,7 @@ use crate::engine::Engine;
 
 /// One rendered table: a title, column headers, and rows of heterogeneous cells
 /// (strings for labels, numbers for statistics, null for "not applicable").
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OutTable {
     pub title: String,
@@ -54,7 +56,7 @@ impl OutTable {
 }
 
 /// A complete procedure result: a heading and one or more tables.
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Analysis {
     pub title: String,
@@ -137,6 +139,29 @@ fn p_strs_opt(params: &JsonValue, key: &str) -> Vec<String> {
 
 // ── Data extraction ──────────────────────────────────────────────────────────
 
+/// Efficiently extract and clean multiple columns using Polars' Lazy API.
+/// Performs listwise deletion (dropping any row with a null/NaN in ANY requested column).
+fn prep_data(df: &DataFrame, cols: &[String]) -> SResult<DataFrame> {
+    if cols.is_empty() {
+        return Ok(df.clone());
+    }
+    let mut lazy = df.clone().lazy();
+    let mut exprs = Vec::new();
+    for name in cols {
+        exprs.push(col(name));
+    }
+    lazy = lazy.select(&exprs).drop_nulls(None);
+    // Only apply NaNs filter to numeric columns.
+    for name in cols {
+        if let Ok(c_col) = df.column(name) {
+            if c_col.dtype().is_numeric() {
+                lazy = lazy.filter(col(name).is_not_nan());
+            }
+        }
+    }
+    lazy.collect().map_err(|e| e.to_string())
+}
+
 /// Column values aligned by row, `None` for null/non-finite. Length == n rows.
 fn col_opt(df: &DataFrame, name: &str) -> SResult<Vec<Option<f64>>> {
     let s = df
@@ -211,20 +236,31 @@ fn describe(x: &[f64]) -> Desc {
         };
     }
     let nf = n as f64;
-    let mean = x.iter().sum::<f64>() / nf;
-    let mut min = x[0];
-    let mut max = x[0];
-    let mut m2 = 0.0;
-    for &v in x {
-        if v < min {
-            min = v;
-        }
-        if v > max {
-            max = v;
-        }
-        let d = v - mean;
-        m2 += d * d;
-    }
+    let mean = x.par_iter().sum::<f64>() / nf;
+
+    let (min, max, m2) = x
+        .par_iter()
+        .fold(
+            || (x[0], x[0], 0.0),
+            |(mut min, mut max, mut m2), &v| {
+                if v < min {
+                    min = v;
+                }
+                if v > max {
+                    max = v;
+                }
+                let d = v - mean;
+                m2 += d * d;
+                (min, max, m2)
+            },
+        )
+        .reduce(
+            || (x[0], x[0], 0.0),
+            |(min1, max1, m2_1), (min2, max2, m2_2)| {
+                (min1.min(min2), max1.max(max2), m2_1 + m2_2)
+            },
+        );
+
     let variance = if n > 1 { m2 / (nf - 1.0) } else { f64::NAN };
     let sd = variance.sqrt();
     let sem = if n > 1 { sd / nf.sqrt() } else { f64::NAN };
@@ -743,6 +779,12 @@ impl Engine {
                     "Cumulative Percent",
                 ],
             );
+            
+            if total == 0 {
+                tables.push(t);
+                continue;
+            }
+
             let mut cum = 0.0;
             for (key, &freq) in &counts {
                 let raw = key.label();
@@ -1304,51 +1346,42 @@ impl Engine {
         let p = independents.len();
 
         // Listwise deletion across y and all predictors.
-        let mut y = Vec::new();
-        let mut x: Vec<Vec<f64>> = Vec::new(); // rows of [1, x1, x2, ...]
+        let mut y_vec = Vec::new();
+        let mut x_flat = Vec::new(); // will convert to Array2
+        let mut n = 0;
         for i in 0..nrows {
             let Some(yi) = y_all[i] else { continue };
             if x_all.iter().any(|c| c[i].is_none()) {
                 continue;
             }
-            y.push(yi);
-            let mut row = vec![1.0];
+            y_vec.push(yi);
+            x_flat.push(1.0);
             for c in &x_all {
-                row.push(c[i].unwrap());
+                x_flat.push(c[i].unwrap());
             }
-            x.push(row);
+            n += 1;
         }
-        let n = y.len();
         if n <= p + 1 {
             return Err("Not enough valid cases for the number of predictors".into());
         }
         let k = p + 1; // params including intercept
+        let y = Array1::from_vec(y_vec);
+        let x = Array2::from_shape_vec((n, k), x_flat).expect("Failed to create design matrix from shape");
 
         // Normal equations: (XᵀX) β = Xᵀy.
-        let mut xtx = vec![vec![0.0; k]; k];
-        let mut xty = vec![0.0; k];
-        for i in 0..n {
-            for a in 0..k {
-                xty[a] += x[i][a] * y[i];
-                for b in 0..k {
-                    xtx[a][b] += x[i][a] * x[i][b];
-                }
-            }
-        }
-        let inv = invert(xtx).ok_or("Predictors are collinear (singular matrix)")?;
-        let beta: Vec<f64> = (0..k)
-            .map(|a| (0..k).map(|b| inv[a][b] * xty[b]).sum())
-            .collect();
+        let xt = x.t();
+        let xtx = xt.dot(&x);
+        let xty = xt.dot(&y);
+        let inv = invert(&xtx).ok_or("Predictors are collinear (singular matrix)")?;
+        let beta = inv.dot(&xty);
 
         // Residuals and sums of squares.
-        let ybar = y.iter().sum::<f64>() / n as f64;
-        let mut ss_res = 0.0;
-        let mut ss_tot = 0.0;
-        for i in 0..n {
-            let yhat: f64 = (0..k).map(|a| beta[a] * x[i][a]).sum();
-            ss_res += (y[i] - yhat).powi(2);
-            ss_tot += (y[i] - ybar).powi(2);
-        }
+        let ybar = y.mean().ok_or("Cannot compute mean of empty dependent variable")?;
+        let yhat = x.dot(&beta);
+        let residuals = &y - &yhat;
+        let ss_res = residuals.mapv(|r| r * r).sum();
+        let ss_tot = y.mapv(|v| (v - ybar).powi(2)).sum();
+
         let ss_reg = ss_tot - ss_res;
         let df_reg = p as f64;
         let df_res = (n - k) as f64;
@@ -1361,13 +1394,17 @@ impl Engine {
         let std_err_est = mse.sqrt();
 
         // SDs for standardized coefficients (betas).
-        let y_sd = describe(&y).sd;
+        let y_sd = describe(y.as_slice().unwrap()).sd;
         let x_sd: Vec<f64> = (0..p)
             .map(|j| {
-                let col: Vec<f64> = x.iter().map(|r| r[j + 1]).collect();
-                describe(&col).sd
+                let col = x.column(j + 1);
+                describe(&col.to_vec()).sd
             })
             .collect();
+        
+        // Ensure y_sd is not NaN before proceeding, fallback to 1.0 to avoid division by zero
+        let y_sd_safe = if y_sd.is_finite() { y_sd } else { 1.0 };
+        let x_sd_safe: Vec<f64> = x_sd.iter().map(|&s| if s.is_finite() { s } else { 1.0 }).collect();
 
         // Model summary.
         let mut summary = OutTable::new(
@@ -1427,7 +1464,7 @@ impl Engine {
             ],
         );
         for a in 0..k {
-            let se = (mse * inv[a][a]).sqrt();
+            let se = (mse * inv[[a, a]]).sqrt();
             let tstat = beta[a] / se;
             let sig = t_sig_2tailed(tstat, df_res);
             let (label, beta_std) = if a == 0 {
@@ -1835,45 +1872,44 @@ impl Engine {
             return Err("Factor analysis needs at least 2 variables".into());
         }
         // Listwise-deleted data matrix.
+        let mut data_flat = Vec::new();
+        let mut n = 0;
         let cols: Vec<Vec<Option<f64>>> =
             vars.iter().map(|v| col_opt(df, v)).collect::<SResult<_>>()?;
         let nrows = df.height();
-        let mut rows: Vec<Vec<f64>> = Vec::new();
         for i in 0..nrows {
             if cols.iter().all(|c| c[i].is_some()) {
-                rows.push(cols.iter().map(|c| c[i].unwrap()).collect());
+                for c in &cols {
+                    data_flat.push(c[i].unwrap());
+                }
+                n += 1;
             }
         }
-        let n = rows.len();
         if n <= p {
             return Err("Not enough complete cases for the number of variables".into());
         }
+        let data = Array2::from_shape_vec((n, p), data_flat).unwrap();
 
         // Correlation matrix R (p × p).
-        let mut means = vec![0.0; p];
-        for r in &rows {
-            for j in 0..p {
-                means[j] += r[j];
-            }
+        let mut corr = Array2::zeros((p, p));
+        let means = data.mean_axis(ndarray::Axis(0)).unwrap();
+        let mut sds = Array1::zeros(p);
+        for j in 0..p {
+            let col = data.column(j);
+            sds[j] = describe(&col.to_vec()).sd;
         }
-        means.iter_mut().for_each(|m| *m /= n as f64);
-        let mut sd = vec![0.0; p];
-        for r in &rows {
-            for j in 0..p {
-                sd[j] += (r[j] - means[j]).powi(2);
-            }
-        }
-        sd.iter_mut().for_each(|s| *s = (*s / (n as f64 - 1.0)).sqrt());
-        let mut corr = vec![vec![0.0; p]; p];
+
         for a in 0..p {
             for b in 0..p {
                 let mut cov = 0.0;
-                for r in &rows {
-                    cov += (r[a] - means[a]) * (r[b] - means[b]);
+                for i in 0..n {
+                    cov += (data[[i, a]] - means[a]) * (data[[i, b]] - means[b]);
                 }
                 cov /= n as f64 - 1.0;
-                corr[a][b] = if sd[a] > 0.0 && sd[b] > 0.0 {
-                    cov / (sd[a] * sd[b])
+                corr[[a, b]] = if sds[a] > 0.0 && sds[b] > 0.0 {
+                    cov / (sds[a] * sds[b])
+                } else if a == b {
+                    1.0
                 } else {
                     0.0
                 };
@@ -1892,11 +1928,11 @@ impl Engine {
         };
 
         // Unrotated loadings: a_ij = v_ij * sqrt(λ_j).
-        let mut loadings = vec![vec![0.0; m]; p]; // p vars × m components
+        let mut loadings = Array2::zeros((p, m)); // p vars × m components
         for (cidx, &ei) in order.iter().take(m).enumerate() {
             let scale = eigvals[ei].max(0.0).sqrt();
             for var in 0..p {
-                loadings[var][cidx] = eigvecs[var][ei] * scale;
+                loadings[[var, cidx]] = eigvecs[[var, ei]] * scale;
             }
         }
 
@@ -1921,17 +1957,20 @@ impl Engine {
         // Communalities (PCA: initial = 1, extraction = Σ loadings²).
         let mut comm = OutTable::new("Communalities", vec!["", "Initial", "Extraction"]);
         for var in 0..p {
-            let extraction: f64 = loadings[var].iter().map(|l| l * l).sum();
+            let mut extraction = 0.0;
+            for c in 0..m {
+                extraction += loadings[[var, c]].powi(2);
+            }
             comm.rows.push(vec![text(self.display(&vars[var])), num(1.0), num(extraction)]);
         }
 
         let mut tables = vec![comm, variance];
-        tables.push(self.loading_table("Component Matrix", vars, &loadings, m));
+        tables.push(self.loading_table("Component Matrix", vars, &loadings));
 
         // Optional varimax rotation.
         if rotation.eq_ignore_ascii_case("varimax") && m > 1 {
             let rotated = varimax(&loadings);
-            tables.push(self.loading_table("Rotated Component Matrix (Varimax)", vars, &rotated, m));
+            tables.push(self.loading_table("Rotated Component Matrix (Varimax)", vars, &rotated));
         }
 
         Ok(Analysis {
@@ -1944,18 +1983,20 @@ impl Engine {
         &self,
         title: &str,
         vars: &[String],
-        loadings: &[Vec<f64>],
-        m: usize,
+        loadings: &Array2<f64>,
     ) -> OutTable {
+        let m = loadings.ncols();
         let mut headers = vec!["".to_string()];
         for c in 0..m {
             headers.push(format!("Component {}", c + 1));
         }
         let refs: Vec<&str> = headers.iter().map(|s| s.as_str()).collect();
         let mut t = OutTable::new(title, refs);
-        for (var, row) in loadings.iter().enumerate() {
+        for var in 0..loadings.nrows() {
             let mut cells = vec![text(self.display(&vars[var]))];
-            cells.extend(row.iter().map(|&l| num(l)));
+            for c in 0..m {
+                cells.push(num(loadings[[var, c]]));
+            }
             t.rows.push(cells);
         }
         t
@@ -2061,81 +2102,44 @@ impl Engine {
         if factors.is_empty() && covariates.is_empty() {
             return Err("Specify at least one factor or covariate".into());
         }
-        // Listwise deletion across dependent, factors, and covariates.
-        let y_all = col_opt(df, dependent)?;
-        let cov_all: Vec<Vec<Option<f64>>> =
-            covariates.iter().map(|c| col_opt(df, c)).collect::<SResult<_>>()?;
-        let fac_all: Vec<Vec<Option<String>>> =
-            factors.iter().map(|f| col_labels(df, f)).collect::<SResult<_>>()?;
-        let nrows = df.height();
-
-        let mut y = Vec::new();
-        let mut keep = Vec::new();
-        for i in 0..nrows {
-            let ok = y_all[i].is_some()
-                && cov_all.iter().all(|c| c[i].is_some())
-                && fac_all.iter().all(|f| f[i].is_some());
-            if ok {
-                y.push(y_all[i].unwrap());
-                keep.push(i);
-            }
-        }
-        let n = y.len();
+        
+        let mut all_cols = vec![dependent.to_string()];
+        all_cols.extend(factors.iter().cloned());
+        all_cols.extend(covariates.iter().cloned());
+        let clean_df = prep_data(df, &all_cols)?;
+        let n = clean_df.height();
         if n < 3 {
             return Err("Not enough complete cases".into());
         }
 
-        // Factor levels (reference = first level, dropped).
-        let levels: Vec<Vec<String>> = factors
-            .iter()
-            .enumerate()
-            .map(|(fi, _)| {
-                let mut lv: Vec<String> =
-                    keep.iter().map(|&i| fac_all[fi][i].clone().unwrap()).collect();
-                lv.sort();
-                lv.dedup();
-                lv
-            })
-            .collect();
+        let y: Vec<f64> = clean_df.column(dependent).unwrap().f64().unwrap().into_no_null_iter().collect();
 
-        // Build effects, each as a set of column vectors (length n).
+        // Factor levels.
+        let levels: Vec<Vec<String>> = factors.iter().map(|f| {
+            let mut lv = col_labels(&clean_df, f).unwrap().into_iter().flatten().collect::<Vec<_>>();
+            lv.sort();
+            lv.dedup();
+            lv
+        }).collect();
+
         let mut effects: Vec<Effect> = Vec::new();
-
-        // Covariates: one continuous column each.
-        for (ci, cov) in covariates.iter().enumerate() {
-            let col: Vec<f64> = keep.iter().map(|&i| cov_all[ci][i].unwrap()).collect();
-            effects.push(Effect { name: self.display(cov), cols: vec![col] });
+        for (_ci, cov) in covariates.iter().enumerate() {
+            let col: Vec<f64> = clean_df.column(cov).unwrap().f64().unwrap().into_no_null_iter().collect();
+            let n_c = col.len();
+            effects.push(Effect { name: self.display(cov), cols: Array2::from_shape_vec((n_c, 1), col).unwrap() });
         }
 
-        // Factor main effects + all interactions (full factorial), via dummy
-        // (reference) coding. An interaction's columns are the elementwise
-        // products of the involved factors' dummy columns.
-        let dummies: Vec<Vec<Vec<f64>>> = factors
-            .iter()
-            .enumerate()
-            .map(|(fi, _)| {
-                levels[fi]
-                    .iter()
-                    .skip(1)
-                    .map(|lev| {
-                        keep.iter()
-                            .map(|&i| if fac_all[fi][i].as_deref() == Some(lev) { 1.0 } else { 0.0 })
-                            .collect::<Vec<f64>>()
-                    })
-                    .collect()
-            })
-            .collect();
+        let dummies: Vec<Vec<Vec<f64>>> = factors.iter().enumerate().map(|(fi, f_name)| {
+            let row_labels = col_labels(&clean_df, f_name).unwrap();
+            levels[fi].iter().skip(1).map(|lev| {
+                row_labels.iter().map(|o| if o.as_deref() == Some(lev) { 1.0 } else { 0.0 }).collect()
+            }).collect()
+        }).collect();
 
         let nf = factors.len();
         for mask in 1u32..(1u32 << nf) {
             let involved: Vec<usize> = (0..nf).filter(|&b| mask & (1 << b) != 0).collect();
-            // Name e.g. "A * B".
-            let name = involved
-                .iter()
-                .map(|&b| self.display(&factors[b]))
-                .collect::<Vec<_>>()
-                .join(" * ");
-            // Cartesian product of the involved factors' dummy columns.
+            let name = involved.iter().map(|&b| self.display(&factors[b])).collect::<Vec<_>>().join(" * ");
             let mut cols: Vec<Vec<f64>> = vec![vec![1.0; n]];
             for &b in &involved {
                 let mut next = Vec::new();
@@ -2146,16 +2150,39 @@ impl Engine {
                 }
                 cols = next;
             }
-            effects.push(Effect { name, cols });
+            let n_r = cols[0].len();
+            let n_c = cols.len();
+            let mut flat = Vec::with_capacity(n_r * n_c);
+            for i in 0..n_r {
+                for j in 0..n_c {
+                    flat.push(cols[j][i]);
+                }
+            }
+            effects.push(Effect { name, cols: Array2::from_shape_vec((n_r, n_c), flat).unwrap() });
         }
 
-        // Full design = intercept + every effect's columns.
-        let intercept = vec![1.0; n];
-        let full: Vec<&Vec<f64>> = std::iter::once(&intercept)
-            .chain(effects.iter().flat_map(|e| e.cols.iter()))
-            .collect();
-        let sse_full = ols_sse(&full, &y).ok_or("Design matrix is singular (collinear effects)")?;
-        let total_cols: usize = effects.iter().map(|e| e.cols.len()).sum();
+        let total_cols: usize = effects.iter().map(|e| e.cols.ncols()).sum();
+        let mut x_flat = Vec::with_capacity(n * (1 + total_cols));
+        x_flat.extend(std::iter::repeat(1.0).take(n));
+        for e in &effects {
+            for col_idx in 0..e.cols.ncols() {
+                for i in 0..n {
+                    x_flat.push(e.cols[[i, col_idx]]);
+                }
+            }
+        }
+        let x_full = Array2::from_shape_vec((1 + total_cols, n), x_flat).unwrap().reversed_axes(); // n x k
+
+        let solve_sse = |x: &Array2<f64>, y: &[f64]| -> Option<f64> {
+            let y_arr = Array1::from_vec(y.to_vec());
+            let xtx = x.t().dot(x);
+            let xtx_inv = invert(&xtx)?;
+            let beta = xtx_inv.dot(&x.t().dot(&y_arr));
+            let resid = &y_arr - &x.dot(&beta);
+            Some(resid.dot(&resid))
+        };
+
+        let sse_full = solve_sse(&x_full, &y).ok_or("Design matrix is singular (collinear effects)")?;
         let df_error = (n - 1 - total_cols) as f64;
         if df_error <= 0.0 {
             return Err("Too many parameters for the number of cases".into());
@@ -2197,28 +2224,27 @@ impl Engine {
 
         t.rows.push(eff_row("Corrected Model", ss_model, df_model));
 
-        // Intercept effect: drop the intercept column only.
-        let no_intercept: Vec<&Vec<f64>> = effects.iter().flat_map(|e| e.cols.iter()).collect();
-        if let Some(sse_ni) = ols_sse(&no_intercept, &y) {
-            t.rows.push(eff_row("Intercept", sse_ni - sse_full, 1.0));
+        // Intercept.
+        if total_cols > 0 {
+            let x_no_int = x_full.slice(ndarray::s![.., 1..]).to_owned();
+            if let Some(sse_ni) = solve_sse(&x_no_int, &y) {
+                t.rows.push(eff_row("Intercept", sse_ni - sse_full, 1.0));
+            }
         }
 
-        // Each effect: Type III SS = SSE(without its columns) − SSE(full).
-        for (ei, e) in effects.iter().enumerate() {
-            let reduced: Vec<&Vec<f64>> = std::iter::once(&intercept)
-                .chain(
-                    effects
-                        .iter()
-                        .enumerate()
-                        .filter(|(j, _)| *j != ei)
-                        .flat_map(|(_, oe)| oe.cols.iter()),
-                )
-                .collect();
-            let ss = match ols_sse(&reduced, &y) {
+        // Effects.
+        let mut cur_col = 1;
+        for e in &effects {
+            let k_e = e.cols.ncols();
+            let mut indices = (0..x_full.ncols()).collect::<Vec<_>>();
+            indices.drain(cur_col..(cur_col + k_e));
+            let x_reduced = x_full.select(ndarray::Axis(1), &indices);
+            let ss = match solve_sse(&x_reduced, &y) {
                 Some(sse_r) => sse_r - sse_full,
                 None => f64::NAN,
             };
-            t.rows.push(eff_row(&e.name, ss, e.cols.len() as f64));
+            t.rows.push(eff_row(&e.name, ss, k_e as f64));
+            cur_col += k_e;
         }
 
         t.rows.push(vec![
@@ -2275,69 +2301,42 @@ impl Engine {
             return Err("Specify at least one factor or covariate".into());
         }
 
-        // Listwise deletion across all variables.
-        let y_cols: Vec<Vec<Option<f64>>> =
-            dependents.iter().map(|v| col_opt(df, v)).collect::<SResult<_>>()?;
-        let fac_all: Vec<Vec<Option<String>>> =
-            factors.iter().map(|f| col_labels(df, f)).collect::<SResult<_>>()?;
-        let cov_all: Vec<Vec<Option<f64>>> =
-            covariates.iter().map(|c| col_opt(df, c)).collect::<SResult<_>>()?;
-        let nrows = df.height();
-
-        let mut keep = Vec::new();
-        for i in 0..nrows {
-            let ok = y_cols.iter().all(|c| c[i].is_some())
-                && fac_all.iter().all(|f| f[i].is_some())
-                && cov_all.iter().all(|c| c[i].is_some());
-            if ok {
-                keep.push(i);
-            }
-        }
-        let n = keep.len();
+        let mut all_cols = dependents.to_vec();
+        all_cols.extend(factors.iter().cloned());
+        all_cols.extend(covariates.iter().cloned());
+        let clean_df = prep_data(df, &all_cols)?;
+        let n = clean_df.height();
         if n < p + 5 {
             return Err("Not enough complete cases".into());
         }
 
-        let y_data: Vec<Vec<f64>> = dependents
-            .iter()
-            .enumerate()
-            .map(|(ji, _)| keep.iter().map(|&i| y_cols[ji][i].unwrap()).collect())
-            .collect();
+        let mut y_flat = Vec::with_capacity(n * p);
+        for dep in dependents {
+            y_flat.extend(clean_df.column(dep).unwrap().f64().unwrap().into_no_null_iter());
+        }
+        let y_data = Array2::from_shape_vec((p, n), y_flat).unwrap(); // p x n
 
-        // Design matrix (Reference coding).
+        // Design matrix.
         let mut effects: Vec<Effect> = Vec::new();
-        for (ci, cov) in covariates.iter().enumerate() {
-            let col: Vec<f64> = keep.iter().map(|&i| cov_all[ci][i].unwrap()).collect();
-            effects.push(Effect { name: self.display(cov), cols: vec![col] });
+        for (_ci, cov) in covariates.iter().enumerate() {
+            let col: Vec<f64> = clean_df.column(cov).unwrap().f64().unwrap().into_no_null_iter().collect();
+            let n_c = col.len();
+            effects.push(Effect { name: self.display(cov), cols: Array2::from_shape_vec((n_c, 1), col).unwrap() });
         }
 
-        let levels: Vec<Vec<String>> = factors
-            .iter()
-            .enumerate()
-            .map(|(fi, _)| {
-                let mut lv: Vec<String> =
-                    keep.iter().map(|&i| fac_all[fi][i].clone().unwrap()).collect();
-                lv.sort();
-                lv.dedup();
-                lv
-            })
-            .collect();
+        let levels: Vec<Vec<String>> = factors.iter().map(|f| {
+            let mut lv = col_labels(&clean_df, f).unwrap().into_iter().flatten().collect::<Vec<_>>();
+            lv.sort();
+            lv.dedup();
+            lv
+        }).collect();
 
-        let dummies: Vec<Vec<Vec<f64>>> = factors
-            .iter()
-            .enumerate()
-            .map(|(fi, _)| {
-                levels[fi]
-                    .iter()
-                    .skip(1)
-                    .map(|lev| {
-                        keep.iter()
-                            .map(|&i| if fac_all[fi][i].as_deref() == Some(lev) { 1.0 } else { 0.0 })
-                            .collect::<Vec<f64>>()
-                    })
-                    .collect()
-            })
-            .collect();
+        let dummies: Vec<Vec<Vec<f64>>> = factors.iter().enumerate().map(|(fi, f_name)| {
+            let row_labels = col_labels(&clean_df, f_name).unwrap();
+            levels[fi].iter().skip(1).map(|lev| {
+                row_labels.iter().map(|o| if o.as_deref() == Some(lev) { 1.0 } else { 0.0 }).collect()
+            }).collect()
+        }).collect();
 
         let nf = factors.len();
         for mask in 1u32..(1u32 << nf) {
@@ -2353,68 +2352,77 @@ impl Engine {
                 }
                 cols = next;
             }
-            effects.push(Effect { name, cols });
+            let n_r = cols[0].len();
+            let n_c = cols.len();
+            let mut flat = Vec::with_capacity(n_r * n_c);
+            for i in 0..n_r {
+                for j in 0..n_c {
+                    flat.push(cols[j][i]);
+                }
+            }
+            effects.push(Effect { name, cols: Array2::from_shape_vec((n_r, n_c), flat).unwrap() });
         }
 
-        let intercept = vec![1.0; n];
-        let full_design: Vec<&Vec<f64>> = std::iter::once(&intercept)
-            .chain(effects.iter().flat_map(|e| e.cols.iter()))
-            .collect();
-
-        let k_cols = full_design.len();
-        let df_h = (k_cols - 1) as f64;
-        let df_e = (n - k_cols) as f64;
+        let total_k = 1 + effects.iter().map(|e| e.cols.ncols()).sum::<usize>();
+        let mut x_flat = Vec::with_capacity(n * total_k);
+        x_flat.extend(std::iter::repeat(1.0).take(n));
+        for e in &effects {
+            for col_idx in 0..e.cols.ncols() {
+                for i in 0..n {
+                    x_flat.push(e.cols[[i, col_idx]]);
+                }
+            }
+        }
+        let x = Array2::from_shape_vec((total_k, n), x_flat).unwrap().reversed_axes(); // n x total_k
+        let df_e = (n - total_k) as f64;
         if df_e <= 0.0 {
             return Err("Too many parameters for the number of cases".into());
         }
 
-        // Parameter estimates (contrasts) for each DV.
+        let xtx = x.t().dot(&x);
+        let xtx_inv = invert(&xtx).ok_or("Design matrix is singular")?;
+
         let mut est_table = OutTable::new(
             "Parameter Estimates",
             vec!["Dependent Variable", "Parameter", "B", "Std. Error", "t", "Sig."],
         );
-        let mut xtx = vec![vec![0.0; k_cols]; k_cols];
-        for a in 0..k_cols {
-            for b in 0..k_cols {
-                xtx[a][b] = (0..n).map(|i| full_design[a][i] * full_design[b][i]).sum();
-            }
-        }
-        let xtx_inv = invert(xtx).ok_or("Design matrix is singular")?;
 
-        let mut e_mat = vec![vec![0.0; p]; p];
-        let mut h_mat = vec![vec![0.0; p]; p];
+        let mut e_mat = Array2::zeros((p, p));
+        let mut h_mat = Array2::zeros((p, p));
 
-        for (ji, dep_name) in dependents.iter().enumerate() {
-            let y = &y_data[ji];
-            let xty: Vec<f64> = (0..k_cols).map(|a| (0..n).map(|i| full_design[a][i] * y[i]).sum()).collect();
-            let beta: Vec<f64> = (0..k_cols).map(|a| (0..k_cols).map(|b| xtx_inv[a][b] * xty[b]).sum()).collect();
-            let yhat: Vec<f64> = (0..n).map(|i| (0..k_cols).map(|a| beta[a] * full_design[a][i]).sum()).collect();
-            let resid: Vec<f64> = (0..n).map(|i| y[i] - yhat[i]).collect();
-            let sse: f64 = resid.iter().map(|r| r * r).sum();
+        for ji in 0..p {
+            let y_ji = y_data.row(ji);
+            let xty = x.t().dot(&y_ji);
+            let beta = xtx_inv.dot(&xty);
+            let yhat = x.dot(&beta);
+            let resid = &y_ji - &yhat;
+            let sse = resid.dot(&resid);
             let mse = sse / df_e;
 
-            // SSCP accumulation for multivariate tests.
             for j2 in 0..p {
-                let y2 = &y_data[j2];
-                let xty2: Vec<f64> = (0..k_cols).map(|a| (0..n).map(|i| full_design[a][i] * y2[i]).sum()).collect();
-                let beta2: Vec<f64> = (0..k_cols).map(|a| (0..k_cols).map(|b| xtx_inv[a][b] * xty2[b]).sum()).collect();
-                let yhat2: Vec<f64> = (0..n).map(|i| (0..k_cols).map(|a| beta2[a] * full_design[a][i]).sum()).collect();
+                let y_j2 = y_data.row(j2);
+                let xty2 = x.t().dot(&y_j2);
+                let beta2 = xtx_inv.dot(&xty2);
+                let yhat2 = x.dot(&beta2);
                 
-                let grand2 = y2.iter().sum::<f64>() / n as f64;
-                h_mat[ji][j2] = (0..n).map(|i| (yhat[i] - (y.iter().sum::<f64>() / n as f64)) * (yhat2[i] - grand2)).sum();
-                e_mat[ji][j2] = (0..n).map(|i| (y[i] - yhat[i]) * (y2[i] - yhat2[i])).sum();
+                let grand2 = y_j2.mean().unwrap();
+                let diff1 = &yhat - y_ji.mean().unwrap();
+                let diff2 = &yhat2 - grand2;
+                h_mat[[ji, j2]] = diff1.dot(&diff2);
+                e_mat[[ji, j2]] = (&y_ji - &yhat).dot(&(&y_j2 - &yhat2));
             }
 
-            // Row for intercept.
-            let se_int = (mse * xtx_inv[0][0]).sqrt();
+            let dep_name = &dependents[ji];
+            let se_int = (mse * xtx_inv[[0, 0]]).sqrt();
             let t_int = beta[0] / se_int;
             est_table.rows.push(vec![text(self.display(dep_name)), text("(Intercept)"), num(beta[0]), num(se_int), num(t_int), num(t_sig_2tailed(t_int, df_e))]);
 
             let mut cur_col = 1;
             for e in &effects {
-                for (cci, _) in e.cols.iter().enumerate() {
+                let n_ec = e.cols.ncols();
+                for cci in 0..n_ec {
                     let b_val = beta[cur_col];
-                    let se = (mse * xtx_inv[cur_col][cur_col]).sqrt();
+                    let se = (mse * xtx_inv[[cur_col, cur_col]]).sqrt();
                     let t_val = b_val / se;
                     est_table.rows.push(vec![
                         text(self.display(dep_name)),
@@ -2429,26 +2437,27 @@ impl Engine {
             }
         }
 
-        // Multivariate Tests.
         let inv_sqrt = sym_inv_sqrt(&e_mat).ok_or("Error matrix is singular")?;
-        let s_mat = mat_mul(&mat_mul(&inv_sqrt, &h_mat), &inv_sqrt);
+        let s_mat = inv_sqrt.dot(&h_mat).dot(&inv_sqrt);
         let (mut eig, _) = jacobi_eigen(&s_mat);
-        eig.iter_mut().for_each(|l| { if *l < 0.0 { *l = 0.0; } });
-        eig.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        eig.mapv_inplace(|l| if l < 0.0 { 0.0 } else { l });
+        let mut eig_vec = eig.to_vec();
+        eig_vec.sort_by(|a, b| b.partial_cmp(a).unwrap());
 
-        let s = (p as f64).min(df_h);
-        let pillai: f64 = eig.iter().map(|&l| l / (1.0 + l)).sum();
-        let wilks: f64 = eig.iter().map(|&l| 1.0 / (1.0 + l)).product();
-        let hotelling: f64 = eig.iter().sum();
-        let roy = eig[0];
+        let pillai: f64 = eig_vec.iter().map(|&l| l / (1.0 + l)).sum();
+        let wilks: f64 = eig_vec.iter().map(|&l| 1.0 / (1.0 + l)).product();
+        let hotelling: f64 = eig_vec.iter().sum();
+        let roy = eig_vec[0];
 
         let mut mv = OutTable::new(
             "Multivariate Tests",
             vec!["Effect", "Value", "F", "Hypothesis df", "Error df", "Sig."],
         );
         let pf = p as f64;
+        let df_h = (total_k - 1) as f64;
         let m = (pf - df_h).abs() / 2.0 - 0.5;
         let nn = (df_e - pf - 1.0) / 2.0;
+        let s = pf.min(df_h);
 
         if s > 0.0 {
             let df1 = s * (2.0 * m + s + 1.0);
@@ -2496,64 +2505,60 @@ impl Engine {
         subject: &str,
         covariates: &[String],
     ) -> SResult<Analysis> {
-        let y_all = col_opt(df, dependent)?;
-        let subj_all = col_labels(df, subject)?;
-        let cov_all: Vec<Vec<Option<f64>>> =
-            covariates.iter().map(|c| col_opt(df, c)).collect::<SResult<_>>()?;
-        let nrows = df.height();
+        let mut all_cols = vec![dependent.to_string(), subject.to_string()];
+        all_cols.extend(covariates.iter().cloned());
+        let clean_df = prep_data(df, &all_cols)?;
 
-        let mut y = Vec::new();
-        let mut subj = Vec::new();
-        let mut x: Vec<Vec<f64>> = Vec::new(); // intercept + covariates
-        for i in 0..nrows {
-            if y_all[i].is_none() || subj_all[i].is_none() || cov_all.iter().any(|c| c[i].is_none()) {
-                continue;
-            }
-            y.push(y_all[i].unwrap());
-            subj.push(subj_all[i].clone().unwrap());
-            let mut row = vec![1.0];
-            for c in &cov_all {
-                row.push(c[i].unwrap());
-            }
-            x.push(row);
-        }
+        let y: Vec<f64> = clean_df.column(dependent).unwrap().f64().unwrap().into_no_null_iter().collect();
+        let subj = col_labels(&clean_df, subject)?;
+        
         let n = y.len();
         let p = 1 + covariates.len();
+        
+        let mut x_flat = Vec::with_capacity(n * p);
+        x_flat.extend(std::iter::repeat(1.0).take(n));
+        for c in covariates {
+            x_flat.extend(clean_df.column(c).unwrap().f64().unwrap().into_no_null_iter());
+        }
+        let x = Array2::from_shape_vec((p, n), x_flat).unwrap().reversed_axes(); // n x p
+
         if n <= p + 1 {
             return Err("Not enough complete cases".into());
         }
 
-        // Group by subject; precompute per-group sufficient statistics.
+        // Group by subject.
         let mut order: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         for i in 0..n {
-            order.entry(subj[i].clone()).or_default().push(i);
+            order.entry(subj[i].clone().unwrap()).or_default().push(i);
         }
         if order.len() < 2 {
             return Err(format!("'{subject}' must have at least 2 levels"));
         }
+
         struct GStat {
             ni: f64,
-            xtx: Vec<Vec<f64>>,
-            xty: Vec<f64>,
-            s: Vec<f64>,
+            xtx: Array2<f64>,
+            xty: Array1<f64>,
+            s: Array1<f64>,
             sy: f64,
             yty: f64,
         }
         let mut gstats: Vec<GStat> = Vec::new();
         for idxs in order.values() {
-            let mut xtx = vec![vec![0.0; p]; p];
-            let mut xty = vec![0.0; p];
-            let mut s = vec![0.0; p];
+            let mut xtx = Array2::zeros((p, p));
+            let mut xty = Array1::zeros(p);
+            let mut s = Array1::zeros(p);
             let mut sy = 0.0;
             let mut yty = 0.0;
             for &i in idxs {
                 sy += y[i];
                 yty += y[i] * y[i];
+                let xi = x.row(i);
                 for a in 0..p {
-                    s[a] += x[i][a];
-                    xty[a] += x[i][a] * y[i];
+                    s[a] += xi[a];
+                    xty[a] += xi[a] * y[i];
                     for b in 0..p {
-                        xtx[a][b] += x[i][a] * x[i][b];
+                        xtx[[a, b]] += xi[a] * xi[b];
                     }
                 }
             }
@@ -2561,9 +2566,9 @@ impl Engine {
         }
 
         let np = (n - p) as f64;
-        let solve = |gamma: f64| -> Option<(Vec<f64>, Vec<Vec<f64>>, f64, f64, f64)> {
-            let mut a = vec![vec![0.0; p]; p];
-            let mut bvec = vec![0.0; p];
+        let solve = |gamma: f64| -> Option<(Array1<f64>, Array2<f64>, f64, f64, f64)> {
+            let mut a = Array2::zeros((p, p));
+            let mut bvec = Array1::zeros(p);
             let mut ytvy = 0.0;
             let mut logdet_v = 0.0;
             for g in &gstats {
@@ -2573,14 +2578,14 @@ impl Engine {
                 for a_i in 0..p {
                     bvec[a_i] += g.xty[a_i] - c * g.s[a_i] * g.sy;
                     for b_i in 0..p {
-                        a[a_i][b_i] += g.xtx[a_i][b_i] - c * g.s[a_i] * g.s[b_i];
+                        a[[a_i, b_i]] += g.xtx[[a_i, b_i]] - c * g.s[a_i] * g.s[b_i];
                     }
                 }
             }
-            let ainv = invert(a.clone())?;
-            let ld_a = log_det(a)?;
-            let beta: Vec<f64> = (0..p).map(|i| (0..p).map(|j| ainv[i][j] * bvec[j]).sum()).collect();
-            let rss = ytvy - (0..p).map(|i| beta[i] * bvec[i]).sum::<f64>();
+            let ainv = invert(&a)?;
+            let ld_a = log_det(&a)?;
+            let beta = ainv.dot(&bvec);
+            let rss = ytvy - beta.dot(&bvec);
             Some((beta, ainv, rss, ld_a, logdet_v))
         };
 
@@ -2627,7 +2632,7 @@ impl Engine {
         )
         .footnote("REML estimation; significance from Wald z tests.");
         for a in 0..p {
-            let se = (var_resid * ainv[a][a]).sqrt();
+            let se = (var_resid * ainv[[a, a]]).sqrt();
             let z = beta[a] / se;
             let label = if a == 0 { "(Intercept)".to_string() } else { self.display(&covariates[a - 1]) };
             fixed.rows.push(vec![
@@ -2669,123 +2674,72 @@ impl Engine {
         random_factors: &[String],
         covariates: &[String],
     ) -> SResult<Analysis> {
-        let y_all = col_opt(df, dependent)?;
-        let rf_all: Vec<Vec<Option<String>>> =
-            random_factors.iter().map(|f| col_labels(df, f)).collect::<SResult<_>>()?;
-        let cov_all: Vec<Vec<Option<f64>>> =
-            covariates.iter().map(|c| col_opt(df, c)).collect::<SResult<_>>()?;
-        let nrows = df.height();
+        let mut all_cols = vec![dependent.to_string()];
+        all_cols.extend(random_factors.iter().cloned());
+        all_cols.extend(covariates.iter().cloned());
+        let clean_df = prep_data(df, &all_cols)?;
 
-        let mut y = Vec::new();
-        let mut rf = vec![Vec::new(); random_factors.len()];
-        let mut x: Vec<Vec<f64>> = Vec::new();
-        for i in 0..nrows {
-            if y_all[i].is_none()
-                || rf_all.iter().any(|f| f[i].is_none())
-                || cov_all.iter().any(|c| c[i].is_none())
-            {
-                continue;
-            }
-            y.push(y_all[i].unwrap());
-            for j in 0..random_factors.len() {
-                rf[j].push(rf_all[j][i].clone().unwrap());
-            }
-            let mut row = vec![1.0];
-            for c in &cov_all {
-                row.push(c[i].unwrap());
-            }
-            x.push(row);
-        }
+        let y_vec: Vec<f64> = clean_df.column(dependent).unwrap().f64().unwrap().into_no_null_iter().collect();
+        let y = Array1::from_vec(y_vec);
+        
         let n = y.len();
         let p = 1 + covariates.len();
         let q = random_factors.len();
-        if n <= p + q {
-            return Err("Not enough complete cases".into());
-        }
 
         if q == 1 {
             return self.mixed_model_single(df, dependent, &random_factors[0], covariates);
         }
 
-        // Build Z matrices (one for each random factor).
-        let mut z: Vec<Vec<Vec<f64>>> = Vec::new();
-        let mut n_levels = Vec::new();
-        for j in 0..q {
-            let unique: BTreeSet<String> = rf[j].iter().cloned().collect();
+        let mut x_flat = Vec::with_capacity(n * p);
+        x_flat.extend(std::iter::repeat(1.0).take(n));
+        for c in covariates {
+            x_flat.extend(clean_df.column(c).unwrap().f64().unwrap().into_no_null_iter());
+        }
+        let x = Array2::from_shape_vec((p, n), x_flat).unwrap().reversed_axes();
+
+        if n <= p + q {
+            return Err("Not enough complete cases".into());
+        }
+
+        // Build Z matrices.
+        let mut z: Vec<Array2<f64>> = Vec::new();
+        for rf_name in random_factors {
+            let labels = col_labels(&clean_df, rf_name).unwrap();
+            let unique: BTreeSet<String> = labels.iter().cloned().flatten().collect();
             let levels: Vec<String> = unique.into_iter().collect();
             let n_l = levels.len();
-            n_levels.push(n_l);
-            let mut zj = vec![vec![0.0; n_l]; n];
+            let mut zj = Array2::zeros((n, n_l));
             for i in 0..n {
-                let l_idx = levels.iter().position(|l| l == &rf[j][i]).unwrap();
-                zj[i][l_idx] = 1.0;
+                let l_idx = levels.iter().position(|l| Some(l) == labels[i].as_ref()).unwrap();
+                zj[[i, l_idx]] = 1.0;
             }
             z.push(zj);
         }
 
-        // GLS solve at given variance ratios gamma_j = sigma^2_j / sigma^2_e.
-        // V = I + sum(gamma_j * Zj * Zj').
-        let solve = |gammas: &[f64]| -> Option<(Vec<f64>, Vec<Vec<f64>>, f64, f64, f64)> {
-            let mut v = vec![vec![0.0; n]; n];
-            for i in 0..n {
-                v[i][i] = 1.0 + 1e-9;
-                for j in 0..q {
-                    for l in 0..n_levels[j] {
-                        if z[j][i][l] > 0.0 {
-                            for i2 in 0..n {
-                                if z[j][i2][l] > 0.0 {
-                                    v[i][i2] += gammas[j];
-                                }
-                            }
-                        }
-                    }
-                }
+        let solve = |gammas: &[f64]| -> Option<(Array1<f64>, Array2<f64>, f64, f64, f64)> {
+            let mut v = Array2::eye(n);
+            v.mapv_inplace(|v| v + 1e-9); // Ridge
+            for j in 0..q {
+                let zj = &z[j];
+                let g_zj = zj.clone() * gammas[j];
+                v += &g_zj.dot(&zj.t());
             }
-            let vinv = invert(v.clone())?;
-            let logdet_v = log_det(v)?;
+            let vinv = invert(&v)?;
+            let logdet_v = log_det(&v)?;
 
-            // X' V^-1 X
-            let mut xtvx = vec![vec![0.0; p]; p];
-            let mut xtvy = vec![0.0; p];
-            for a in 0..p {
-                let mut v_inv_xa = vec![0.0; n];
-                for i in 0..n {
-                    for k in 0..n {
-                        v_inv_xa[i] += vinv[i][k] * x[k][a];
-                    }
-                }
-                for b in 0..p {
-                    for i in 0..n {
-                        xtvx[a][b] += x[i][b] * v_inv_xa[i];
-                    }
-                }
-                for i in 0..n {
-                    xtvy[a] += v_inv_xa[i] * y[i];
-                }
-            }
+            let xtvx = x.t().dot(&vinv).dot(&x);
+            let xtvy = x.t().dot(&vinv).dot(&y);
 
-            let ainv = invert(xtvx.clone())?;
-            let ld_a = log_det(xtvx)?;
-            let beta: Vec<f64> = (0..p).map(|i| (0..p).map(|j| ainv[i][j] * xtvy[j]).sum()).collect();
+            let ainv = invert(&xtvx)?;
+            let ld_a = log_det(&xtvx)?;
+            let beta = ainv.dot(&xtvy);
 
-            // y' V^-1 y - beta' (X' V^-1 y)
-            let mut ytvy = 0.0;
-            for i in 0..n {
-                let mut v_inv_yi = 0.0;
-                for k in 0..n {
-                    v_inv_yi += vinv[i][k] * y[k];
-                }
-                ytvy += y[i] * v_inv_yi;
-            }
-            let rss = ytvy - (0..p).map(|i| beta[i] * xtvy[i]).sum::<f64>();
+            let resid = &y - &x.dot(&beta);
+            let rss = resid.dot(&vinv).dot(&resid);
 
             Some((beta, ainv, rss, ld_a, logdet_v))
         };
 
-        // Minimise -2 REML deviance over gammas.
-        // For q > 1, we use a simple coordinate descent / grid search for now.
-        // Real-world mixed model solvers use derivative-based optimization (AIJ, NR).
-        let mut gammas = vec![0.0; q];
         let np = (n - p) as f64;
         let deviance = |gs: &[f64]| -> f64 {
             match solve(gs) {
@@ -2794,7 +2748,7 @@ impl Engine {
             }
         };
 
-        // Coordinate descent.
+        let mut gammas = vec![0.0; q];
         for _ in 0..5 {
             for j in 0..q {
                 let mut best_g = gammas[j];
@@ -2819,14 +2773,13 @@ impl Engine {
         let var_resid = rss / np;
         let neg2ll = np * (rss / np).ln() + ld_v + ld_a + np * (1.0 + (2.0 * std::f64::consts::PI).ln());
 
-        // Fixed effects.
         let mut fixed = OutTable::new(
             "Fixed Effects Estimates",
             vec!["", "Estimate", "Std. Error", "z", "Sig.", "95% CI Lower", "95% CI Upper"],
         )
         .footnote("REML estimation; significance from Wald z tests.");
         for a in 0..p {
-            let se = (var_resid * ainv[a][a]).sqrt();
+            let se = (var_resid * ainv[[a, a]]).sqrt();
             let z = beta[a] / se;
             let label = if a == 0 { "(Intercept)".to_string() } else { self.display(&covariates[a - 1]) };
             fixed.rows.push(vec![
@@ -2996,43 +2949,28 @@ impl Engine {
         if p == 0 {
             return Err("Cox regression needs at least one covariate".into());
         }
-        let times = col_opt(df, time)?;
-        let starts = match start_time {
-            Some(s) => Some(col_opt(df, s)?),
-            None => None,
-        };
-        let stat_labels = col_labels(df, status)?;
-        let cov_cols: Vec<Vec<Option<f64>>> =
-            covariates.iter().map(|c| col_opt(df, c)).collect::<SResult<_>>()?;
-        let nrows = df.height();
 
-        // Listwise deletion; record (start, stop, event, centered covariate vector).
-        let mut t_start = Vec::new();
-        let mut t_stop = Vec::new();
-        let mut ev = Vec::new();
-        let mut x: Vec<Vec<f64>> = Vec::new();
-        for i in 0..nrows {
-            let (Some(ti), Some(sl)) = (times[i], stat_labels[i].clone()) else {
-                continue;
-            };
-            if cov_cols.iter().any(|c| c[i].is_none()) {
-                continue;
-            }
-            let start = match &starts {
-                Some(s) => match s[i] {
-                    Some(val) => val,
-                    None => continue,
-                },
-                None => 0.0,
-            };
-            if ti <= start {
-                continue; // Invalid interval
-            }
-            t_start.push(start);
-            t_stop.push(ti);
-            ev.push(sl == event_value);
-            x.push(cov_cols.iter().map(|c| c[i].unwrap()).collect());
+        // Optimized data preparation.
+        let mut all_cols = vec![time.to_string(), status.to_string()];
+        if let Some(s) = start_time {
+            all_cols.push(s.to_string());
         }
+        all_cols.extend(covariates.iter().cloned());
+        let clean_df = prep_data(df, &all_cols)?;
+
+        let t_stop: Vec<f64> = clean_df.column(time).unwrap().f64().unwrap().into_no_null_iter().collect();
+        let t_start: Vec<f64> = match start_time {
+            Some(s) => clean_df.column(s).unwrap().f64().unwrap().into_no_null_iter().collect(),
+            None => vec![0.0; t_stop.len()],
+        };
+        let ev: Vec<bool> = col_labels(&clean_df, status)?.into_iter().map(|o| o == Some(event_value.into())).collect();
+        
+        let mut x_flat = Vec::with_capacity(t_stop.len() * p);
+        for c in covariates {
+            x_flat.extend(clean_df.column(c).unwrap().f64().unwrap().into_no_null_iter());
+        }
+        let x = Array2::from_shape_vec((p, t_stop.len()), x_flat).unwrap().reversed_axes(); // n x p
+
         let n = t_stop.len();
         let n_events = ev.iter().filter(|&&e| e).count();
         if n_events == 0 {
@@ -3043,16 +2981,9 @@ impl Engine {
         }
 
         // Centre covariates.
-        let means: Vec<f64> = (0..p)
-            .map(|j| x.iter().map(|r| r[j]).sum::<f64>() / n as f64)
-            .collect();
-        for row in &mut x {
-            for j in 0..p {
-                row[j] -= means[j];
-            }
-        }
+        let means = x.mean_axis(ndarray::Axis(0)).unwrap();
+        let x_centered = &x - &means;
 
-        // Unique event times for Breslow ties.
         let mut event_times: Vec<f64> = Vec::new();
         for i in 0..n {
             if ev[i] {
@@ -3062,82 +2993,94 @@ impl Engine {
         event_times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         event_times.dedup_by(|a, b| (*a - *b).abs() < 1e-10);
 
-        // Partial log-likelihood, score, and information at β.
-        let eval = |beta: &[f64]| -> (f64, Vec<f64>, Vec<Vec<f64>>) {
-            let mut ll = 0.0;
-            let mut score = vec![0.0; p];
-            let mut info = vec![vec![0.0; p]; p];
+        let eval = |beta_vec: &[f64]| -> (f64, Vec<f64>, Array2<f64>) {
+            let beta = Array1::from_vec(beta_vec.to_vec());
+            let etas = x_centered.dot(&beta);
+            let exp_etas = etas.mapv(|e| e.exp());
 
-            let etas: Vec<f64> = (0..n)
-                .map(|i| (0..p).map(|j| beta[j] * x[i][j]).sum::<f64>())
-                .collect();
-            let exp_etas: Vec<f64> = etas.iter().map(|e| e.exp()).collect();
-
-            for &et in &event_times {
+            let results: Vec<(f64, Vec<f64>, Array2<f64>)> = event_times.par_iter().map(|&et| {
                 let mut s0 = 0.0;
-                let mut s1 = vec![0.0; p];
-                let mut s2 = vec![vec![0.0; p]; p];
+                let mut s1: Array1<f64> = Array1::zeros(p);
+                let mut s2: Array2<f64> = Array2::zeros((p, p));
                 let mut d_events = 0;
-                let mut d_score = vec![0.0; p];
+                let mut d_score: Array1<f64> = Array1::zeros(p);
                 let mut d_eta = 0.0;
 
                 for i in 0..n {
-                    // Risk set: subjects whose interval contains the event time.
                     if t_start[i] < et && t_stop[i] >= et {
-                        s0 += exp_etas[i];
+                        let w = exp_etas[i];
+                        s0 += w;
                         for a in 0..p {
-                            s1[a] += exp_etas[i] * x[i][a];
+                            let w_xa = w * x_centered[[i, a]];
+                            s1[a] += w_xa;
                             for b in 0..p {
-                                s2[a][b] += exp_etas[i] * x[i][a] * x[i][b];
+                                s2[[a, b]] += w_xa * x_centered[[i, b]];
                             }
                         }
-                        // Ties at this event time.
                         if ev[i] && (t_stop[i] - et).abs() < 1e-10 {
                             d_events += 1;
                             d_eta += etas[i];
                             for a in 0..p {
-                                d_score[a] += x[i][a];
+                                d_score[a] += x_centered[[i, a]];
                             }
                         }
                     }
                 }
 
                 if d_events > 0 {
-                    ll += d_eta - (d_events as f64) * s0.ln();
+                    let ll = d_eta - (d_events as f64) * s0.ln();
+                    let mut score: Array1<f64> = Array1::zeros(p);
+                    let mut info: Array2<f64> = Array2::zeros((p, p));
+                    let ea = &s1 / s0;
                     for a in 0..p {
-                        let ea = s1[a] / s0;
-                        score[a] += d_score[a] - (d_events as f64) * ea;
+                        score[a] = d_score[a] - (d_events as f64) * ea[a];
                         for b in 0..p {
-                            let eb = s1[b] / s0;
-                            info[a][b] += (d_events as f64) * (s2[a][b] / s0 - ea * eb);
+                            info[[a, b]] = (d_events as f64) * (s2[[a, b]] / s0 - ea[a] * ea[b]);
                         }
                     }
+                    (ll, score.to_vec(), info)
+                } else {
+                    (0.0, vec![0.0; p], Array2::zeros((p, p)))
                 }
+            }).collect();
+
+            let mut total_ll = 0.0;
+            let mut total_score = vec![0.0; p];
+            let mut total_info = Array2::zeros((p, p));
+            for (ll, score, info) in results {
+                total_ll += ll;
+                for a in 0..p {
+                    total_score[a] += score[a];
+                }
+                total_info += &info;
             }
-            (ll, score, info)
+            (total_ll, total_score, total_info)
         };
 
         // Newton-Raphson.
         let mut beta = vec![0.0; p];
         let ll0 = eval(&vec![0.0; p]).0;
         let mut ll = ll0;
-        let mut last_info = vec![vec![0.0; p]; p];
+        let mut last_info = Array2::zeros((p, p));
         for _ in 0..50 {
             let (cur_ll, score, info) = eval(&beta);
             ll = cur_ll;
             last_info = info.clone();
-            let inv = invert(info).ok_or("Information matrix is singular (collinear covariates)")?;
-            let step: Vec<f64> = (0..p).map(|a| (0..p).map(|b| inv[a][b] * score[b]).sum()).collect();
+            let inv = invert(&info).ok_or("Information matrix is singular (collinear covariates)")?;
             let mut max_step = 0.0_f64;
             for a in 0..p {
-                beta[a] += step[a];
-                max_step = max_step.max(step[a].abs());
+                let mut step_a = 0.0;
+                for b in 0..p {
+                    step_a += inv[[a, b]] * score[b];
+                }
+                beta[a] += step_a;
+                max_step = max_step.max(step_a.abs());
             }
             if max_step < 1e-8 {
                 break;
             }
         }
-        let inv = invert(last_info).ok_or("Information matrix is singular")?;
+        let inv = invert(&last_info).ok_or("Information matrix is singular")?;
 
         // Omnibus likelihood-ratio test.
         let lr = 2.0 * (ll - ll0);
@@ -3168,7 +3111,7 @@ impl Engine {
             ],
         );
         for j in 0..p {
-            let se = inv[j][j].sqrt();
+            let se = inv[[j, j]].sqrt();
             let wald = (beta[j] / se).powi(2);
             vars.rows.push(vec![
                 text(self.display(&covariates[j])),
@@ -3630,19 +3573,16 @@ fn ordered_levels(labels: &[Option<String>]) -> Vec<String> {
 /// Jacobi eigenvalue algorithm for a real symmetric matrix. Returns
 /// (eigenvalues, eigenvectors) where eigenvectors[i][j] is the i-th component of
 /// the j-th eigenvector (columns are eigenvectors).
-fn jacobi_eigen(input: &[Vec<f64>]) -> (Vec<f64>, Vec<Vec<f64>>) {
-    let n = input.len();
-    let mut a = input.to_vec();
-    let mut v = (0..n)
-        .map(|i| (0..n).map(|j| if i == j { 1.0 } else { 0.0 }).collect::<Vec<_>>())
-        .collect::<Vec<_>>();
+fn jacobi_eigen(input: &Array2<f64>) -> (Array1<f64>, Array2<f64>) {
+    let n = input.nrows();
+    let mut a = input.clone();
+    let mut v = Array2::eye(n);
 
     for _sweep in 0..100 {
-        // Sum of off-diagonal magnitudes; stop when negligible.
         let mut off = 0.0;
         for i in 0..n {
             for j in (i + 1)..n {
-                off += a[i][j].abs();
+                off += a[[i, j]].abs();
             }
         }
         if off < 1e-12 {
@@ -3650,53 +3590,52 @@ fn jacobi_eigen(input: &[Vec<f64>]) -> (Vec<f64>, Vec<Vec<f64>>) {
         }
         for p in 0..n {
             for q in (p + 1)..n {
-                if a[p][q].abs() < 1e-300 {
+                if a[[p, q]].abs() < 1e-300 {
                     continue;
                 }
-                let theta = (a[q][q] - a[p][p]) / (2.0 * a[p][q]);
+                let theta = (a[[q, q]] - a[[p, p]]) / (2.0 * a[[p, q]]);
                 let t = theta.signum() / (theta.abs() + (theta * theta + 1.0).sqrt());
                 let c = 1.0 / (t * t + 1.0).sqrt();
                 let s = t * c;
-                // Rotate A.
+
                 for i in 0..n {
-                    let aip = a[i][p];
-                    let aiq = a[i][q];
-                    a[i][p] = c * aip - s * aiq;
-                    a[i][q] = s * aip + c * aiq;
+                    let aip = a[[i, p]];
+                    let aiq = a[[i, q]];
+                    a[[i, p]] = c * aip - s * aiq;
+                    a[[i, q]] = s * aip + c * aiq;
                 }
                 for i in 0..n {
-                    let api = a[p][i];
-                    let aqi = a[q][i];
-                    a[p][i] = c * api - s * aqi;
-                    a[q][i] = s * api + c * aqi;
+                    let api = a[[p, i]];
+                    let aqi = a[[q, i]];
+                    a[[p, i]] = c * api - s * aqi;
+                    a[[q, i]] = s * api + c * aqi;
                 }
-                // Accumulate eigenvectors.
                 for i in 0..n {
-                    let vip = v[i][p];
-                    let viq = v[i][q];
-                    v[i][p] = c * vip - s * viq;
-                    v[i][q] = s * vip + c * viq;
+                    let vip = v[[i, p]];
+                    let viq = v[[i, q]];
+                    v[[i, p]] = c * vip - s * viq;
+                    v[[i, q]] = s * vip + c * viq;
                 }
             }
         }
     }
-    let eigvals = (0..n).map(|i| a[i][i]).collect();
+    let eigvals = Array1::from_iter((0..n).map(|i| a[[i, i]]));
     (eigvals, v)
 }
 
 /// Kaiser varimax rotation of a loadings matrix (p vars × m components).
-fn varimax(loadings: &[Vec<f64>]) -> Vec<Vec<f64>> {
-    let p = loadings.len();
-    let m = loadings[0].len();
-    let mut l = loadings.to_vec();
+fn varimax(loadings_in: &Array2<f64>) -> Array2<f64> {
+    let p = loadings_in.nrows();
+    let m = loadings_in.ncols();
+    let mut l = loadings_in.clone();
     for _ in 0..50 {
         let mut converged = true;
         for c1 in 0..m {
             for c2 in (c1 + 1)..m {
                 let (mut u_sum, mut v_sum, mut u2v2, mut uv2) = (0.0, 0.0, 0.0, 0.0);
-                for row in l.iter() {
-                    let x = row[c1];
-                    let y = row[c2];
+                for i in 0..p {
+                    let x = l[[i, c1]];
+                    let y = l[[i, c2]];
                     let u = x * x - y * y;
                     let v = 2.0 * x * y;
                     u_sum += u;
@@ -3714,11 +3653,11 @@ fn varimax(loadings: &[Vec<f64>]) -> Vec<Vec<f64>> {
                     converged = false;
                 }
                 let (cos, sin) = (angle.cos(), angle.sin());
-                for row in l.iter_mut() {
-                    let x = row[c1];
-                    let y = row[c2];
-                    row[c1] = cos * x + sin * y;
-                    row[c2] = -sin * x + cos * y;
+                for i in 0..p {
+                    let x = l[[i, c1]];
+                    let y = l[[i, c2]];
+                    l[[i, c1]] = cos * x + sin * y;
+                    l[[i, c2]] = -sin * x + cos * y;
                 }
             }
         }
@@ -3752,10 +3691,10 @@ fn pearson(a: &[f64], b: &[f64]) -> f64 {
     cov / (va.sqrt() * vb.sqrt())
 }
 
-/// A named GLM effect carrying its own design columns (each length n).
+/// A named GLM effect carrying its own design columns (n rows × k columns).
 struct Effect {
     name: String,
-    cols: Vec<Vec<f64>>,
+    cols: Array2<f64>,
 }
 
 /// Greenhouse-Geisser sphericity correction ε (Box's formula) from repeated-
@@ -3767,28 +3706,25 @@ fn greenhouse_geisser(data: &[Vec<f64>], means: &[f64]) -> f64 {
         return 1.0;
     }
     // Sample covariance matrix S (k × k).
-    let mut s = vec![vec![0.0; k]; k];
+    let mut s = Array2::zeros((k, k));
     for row in data {
         for a in 0..k {
             for b in 0..k {
-                s[a][b] += (row[a] - means[a]) * (row[b] - means[b]);
+                s[[a, b]] += (row[a] - means[a]) * (row[b] - means[b]);
             }
         }
     }
-    for a in 0..k {
-        for b in 0..k {
-            s[a][b] /= n - 1.0;
-        }
-    }
-    let kf = k as f64;
-    let diag_mean = (0..k).map(|i| s[i][i]).sum::<f64>() / kf;
-    let grand = s.iter().flat_map(|r| r.iter()).sum::<f64>() / (kf * kf);
-    let row_means: Vec<f64> = s.iter().map(|r| r.iter().sum::<f64>() / kf).collect();
-    let sum_sq: f64 = s.iter().flat_map(|r| r.iter()).map(|v| v * v).sum();
-    let sum_row_sq: f64 = row_means.iter().map(|m| m * m).sum();
+    s.mapv_inplace(|v| v / (n - 1.0));
 
-    let numer = kf * kf * (diag_mean - grand).powi(2);
-    let denom = (kf - 1.0) * (sum_sq - 2.0 * kf * sum_row_sq + kf * kf * grand * grand);
+    let kf = k as f64;
+    let diag_mean: f64 = s.diag().mean().unwrap();
+    let grand: f64 = s.mean().unwrap();
+    let row_means = s.mean_axis(ndarray::Axis(1)).unwrap();
+    let sum_sq = s.mapv(|v| v * v).sum();
+    let sum_row_sq = row_means.mapv(|v| v * v).sum();
+
+    let numer: f64 = kf * kf * (diag_mean - grand).powi(2);
+    let denom: f64 = (kf - 1.0) * (sum_sq - 2.0 * kf * sum_row_sq + kf * kf * grand * grand);
     if denom <= 0.0 {
         return 1.0;
     }
@@ -3825,7 +3761,7 @@ fn log_rank(groups: &BTreeMap<String, Vec<(f64, bool)>>) -> SResult<OutTable> {
     let mut observed = vec![0.0; g];
     let mut expected = vec![0.0; g];
     // (k−1) × (k−1) covariance of (O − E).
-    let mut cov = vec![vec![0.0; g - 1]; g - 1];
+    let mut cov = Array2::zeros((g - 1, g - 1));
 
     for &et in &event_times {
         let at_risk: Vec<f64> = data
@@ -3849,18 +3785,18 @@ fn log_rank(groups: &BTreeMap<String, Vec<(f64, bool)>>) -> SResult<OutTable> {
         for i in 0..(g - 1) {
             for j in 0..(g - 1) {
                 let kron = if i == j { 1.0 } else { 0.0 };
-                cov[i][j] += factor * (kron * at_risk[i] / n - at_risk[i] * at_risk[j] / (n * n));
+                cov[[i, j]] += factor * (kron * at_risk[i] / n - at_risk[i] * at_risk[j] / (n * n));
             }
         }
     }
 
     let diff: Vec<f64> = (0..(g - 1)).map(|i| observed[i] - expected[i]).collect();
-    let chi = match invert(cov) {
+    let chi = match invert(&cov) {
         Some(ci) => {
             let mut q = 0.0;
             for i in 0..(g - 1) {
                 for j in 0..(g - 1) {
-                    q += diff[i] * ci[i][j] * diff[j];
+                    q += diff[i] * ci[[i, j]] * diff[j];
                 }
             }
             q
@@ -3886,136 +3822,112 @@ fn log_rank(groups: &BTreeMap<String, Vec<(f64, bool)>>) -> SResult<OutTable> {
     Ok(t)
 }
 
-/// Matrix product A·B for square/compatible row-major matrices.
-fn mat_mul(a: &[Vec<f64>], b: &[Vec<f64>]) -> Vec<Vec<f64>> {
-    let n = a.len();
-    let m = b[0].len();
-    let k = b.len();
-    let mut out = vec![vec![0.0; m]; n];
-    for i in 0..n {
-        for l in 0..k {
-            let ail = a[i][l];
-            for j in 0..m {
-                out[i][j] += ail * b[l][j];
-            }
-        }
-    }
-    out
+/// Matrix product A·B.
+fn mat_mul(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
+    a.dot(b)
 }
 
-/// Symmetric inverse square root E^(−1/2) via eigen-decomposition (E symmetric
-/// positive-definite). Returns None if E is singular.
-fn sym_inv_sqrt(e: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
+/// Symmetric inverse square root E^(−1/2) via eigen-decomposition.
+fn sym_inv_sqrt(e: &Array2<f64>) -> Option<Array2<f64>> {
     let (vals, vecs) = jacobi_eigen(e);
-    let n = e.len();
+    let n = e.nrows();
     if vals.iter().any(|&l| l <= 1e-12) {
         return None;
     }
-    let mut out = vec![vec![0.0; n]; n];
+    let mut out = Array2::zeros((n, n));
     for a in 0..n {
         for b in 0..n {
             let mut s = 0.0;
             for j in 0..n {
-                s += vecs[a][j] * vecs[b][j] / vals[j].sqrt();
+                s += vecs[[a, j]] * vecs[[b, j]] / vals[j].sqrt();
             }
-            out[a][b] = s;
+            out[[a, b]] = s;
         }
     }
     Some(out)
 }
 
-/// OLS residual sum of squares for a design given as column vectors and a
-/// response `y`. Returns None if the normal-equations matrix is singular.
-fn ols_sse(columns: &[&Vec<f64>], y: &[f64]) -> Option<f64> {
-    let n = y.len();
-    let k = columns.len();
-    if k == 0 {
-        let ybar = y.iter().sum::<f64>() / n as f64;
-        return Some(y.iter().map(|v| (v - ybar).powi(2)).sum());
-    }
-    // Normal equations (XᵀX) β = Xᵀy.
-    let mut xtx = vec![vec![0.0; k]; k];
-    let mut xty = vec![0.0; k];
-    for i in 0..n {
-        for a in 0..k {
-            let xa = columns[a][i];
-            xty[a] += xa * y[i];
-            for b in 0..k {
-                xtx[a][b] += xa * columns[b][i];
-            }
-        }
-    }
-    let inv = invert(xtx)?;
-    let beta: Vec<f64> = (0..k)
-        .map(|a| (0..k).map(|b| inv[a][b] * xty[b]).sum())
-        .collect();
-    let mut sse = 0.0;
-    for i in 0..n {
-        let yhat: f64 = (0..k).map(|a| beta[a] * columns[a][i]).sum();
-        sse += (y[i] - yhat).powi(2);
-    }
-    Some(sse)
+/// OLS residual sum of squares.
+fn ols_sse(x: &Array2<f64>, y: &Array1<f64>) -> Option<f64> {
+    let xtx = x.t().dot(x);
+    let xtx_inv = invert(&xtx)?;
+    let beta = xtx_inv.dot(&x.t().dot(y));
+    let resid = y - &x.dot(&beta);
+    Some(resid.dot(&resid))
 }
 
 /// Natural log of |det(A)| via Gaussian elimination with partial pivoting.
-/// Returns None if (near-)singular. Used by the REML mixed-model objective.
-fn log_det(mut a: Vec<Vec<f64>>) -> Option<f64> {
-    let n = a.len();
+fn log_det(a_in: &Array2<f64>) -> Option<f64> {
+    let n = a_in.nrows();
+    let mut a = a_in.clone();
     let mut ld = 0.0;
     for col in 0..n {
         let mut pivot = col;
         for r in (col + 1)..n {
-            if a[r][col].abs() > a[pivot][col].abs() {
+            if a[[r, col]].abs() > a[[pivot, col]].abs() {
                 pivot = r;
             }
         }
-        if a[pivot][col].abs() < 1e-12 {
+        if a[[pivot, col]].abs() < 1e-12 {
             return None;
         }
-        a.swap(col, pivot);
-        ld += a[col][col].abs().ln();
+        // Swap rows.
+        for j in col..n {
+            let tmp = a[[col, j]];
+            a[[col, j]] = a[[pivot, j]];
+            a[[pivot, j]] = tmp;
+        }
+        ld += a[[col, col]].abs().ln();
         for r in (col + 1)..n {
-            let factor = a[r][col] / a[col][col];
-            for j in col..n {
-                a[r][j] -= factor * a[col][j];
+            let factor = a[[r, col]] / a[[col, col]];
+            for j in (col + 1)..n {
+                let val = a[[col, j]];
+                a[[r, j]] -= factor * val;
             }
         }
     }
     Some(ld)
 }
 
-/// In-place Gauss-Jordan inversion; returns None if singular.
-fn invert(mut a: Vec<Vec<f64>>) -> Option<Vec<Vec<f64>>> {
-    let n = a.len();
-    let mut inv = (0..n)
-        .map(|i| (0..n).map(|j| if i == j { 1.0 } else { 0.0 }).collect::<Vec<_>>())
-        .collect::<Vec<_>>();
+/// Matrix inversion via Gauss-Jordan elimination.
+fn invert(a_in: &Array2<f64>) -> Option<Array2<f64>> {
+    let n = a_in.nrows();
+    let mut a = a_in.clone();
+    let mut inv = Array2::eye(n);
     for col in 0..n {
-        // Partial pivot.
         let mut pivot = col;
         for r in (col + 1)..n {
-            if a[r][col].abs() > a[pivot][col].abs() {
+            if a[[r, col]].abs() > a[[pivot, col]].abs() {
                 pivot = r;
             }
         }
-        if a[pivot][col].abs() < 1e-12 {
+        if a[[pivot, col]].abs() < 1e-12 {
             return None;
         }
-        a.swap(col, pivot);
-        inv.swap(col, pivot);
-        let d = a[col][col];
+        // Swap rows.
         for j in 0..n {
-            a[col][j] /= d;
-            inv[col][j] /= d;
+            let tmp_a = a[[col, j]];
+            a[[col, j]] = a[[pivot, j]];
+            a[[pivot, j]] = tmp_a;
+            let tmp_i = inv[[col, j]];
+            inv[[col, j]] = inv[[pivot, j]];
+            inv[[pivot, j]] = tmp_i;
+        }
+        let d = a[[col, col]];
+        for j in 0..n {
+            a[[col, j]] /= d;
+            inv[[col, j]] /= d;
         }
         for r in 0..n {
             if r == col {
                 continue;
             }
-            let factor = a[r][col];
+            let factor = a[[r, col]];
             for j in 0..n {
-                a[r][j] -= factor * a[col][j];
-                inv[r][j] -= factor * inv[col][j];
+                let val_a = a[[col, j]];
+                a[[r, j]] -= factor * val_a;
+                let val_i = inv[[col, j]];
+                inv[[r, j]] -= factor * val_i;
             }
         }
     }
@@ -4229,15 +4141,13 @@ mod tests {
 
     #[test]
     fn jacobi_recovers_eigenvalues() {
-        // [[2,0],[0,3]] → eigenvalues {2,3}, identity eigenvectors.
-        let (vals, _) = jacobi_eigen(&[vec![2.0, 0.0], vec![0.0, 3.0]]);
-        let mut v = vals.clone();
+        let (vals, _) = jacobi_eigen(&ndarray::array![[2.0, 0.0], [0.0, 3.0]]);
+        let mut v = vals.to_vec();
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
         close(v[0], 2.0, 1e-9);
         close(v[1], 3.0, 1e-9);
-        // A 2×2 correlation-like matrix [[1,0.6],[0.6,1]] → eigenvalues 1.6, 0.4.
-        let (vals2, _) = jacobi_eigen(&[vec![1.0, 0.6], vec![0.6, 1.0]]);
-        let mut v2 = vals2.clone();
+        let (vals2, _) = jacobi_eigen(&ndarray::array![[1.0, 0.6], [0.6, 1.0]]);
+        let mut v2 = vals2.to_vec();
         v2.sort_by(|a, b| a.partial_cmp(b).unwrap());
         close(v2[0], 0.4, 1e-9);
         close(v2[1], 1.6, 1e-9);
@@ -4461,13 +4371,13 @@ mod tests {
 
     #[test]
     fn invert_identity() {
-        let m = vec![vec![4.0, 7.0], vec![2.0, 6.0]];
-        let inv = invert(m).unwrap();
+        let m = ndarray::array![[4.0, 7.0], [2.0, 6.0]];
+        let inv = invert(&m).unwrap();
         // inverse of [[4,7],[2,6]] = [[0.6,-0.7],[-0.2,0.4]]
-        close(inv[0][0], 0.6, 1e-9);
-        close(inv[0][1], -0.7, 1e-9);
-        close(inv[1][0], -0.2, 1e-9);
-        close(inv[1][1], 0.4, 1e-9);
+        close(inv[[0, 0]], 0.6, 1e-9);
+        close(inv[[0, 1]], -0.7, 1e-9);
+        close(inv[[1, 0]], -0.2, 1e-9);
+        close(inv[[1, 1]], 0.4, 1e-9);
     }
 
     #[test]

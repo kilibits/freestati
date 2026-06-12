@@ -151,8 +151,9 @@ fn run_analysis(
     state: State<EngineState>,
     procedure: String,
     params: JsonValue,
-) -> Result<stats::Analysis, String> {
-    state.lock().unwrap().run_analysis(&procedure, &params)
+) -> Result<Vec<u8>, String> {
+    let analysis = state.lock().unwrap().run_analysis(&procedure, &params)?;
+    rmp_serde::to_vec(&analysis).map_err(|e| e.to_string())
 }
 
 #[tauri::command(async)]

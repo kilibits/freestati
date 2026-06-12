@@ -81,8 +81,11 @@ const electron = {
 
   // ── Statistical procedures & charts ─────────────────────────────────────────
   analysis: {
-    run: (procedure: string, params: Record<string, unknown>) =>
-      invoke('run_analysis', { procedure, params }),
+    run: async (procedure: string, params: Record<string, unknown>) => {
+      const { decode } = await import('@msgpack/msgpack');
+      const bytes = await invoke<number[]>('run_analysis', { procedure, params });
+      return decode(new Uint8Array(bytes));
+    },
     chart: (kind: string, params: Record<string, unknown>) =>
       invoke('run_chart', { kind, params }),
     async exportText(contents: string): Promise<string | null> {
