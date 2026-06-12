@@ -1,14 +1,33 @@
 import { dataStore } from '../stores/dataStore';
 import { DataView } from './DataView';
 import { FileExplorer } from './FileExplorer';
+import { OutputView } from './OutputView';
 import { StatusBar } from './StatusBar';
 import { VariableView } from './VariableView';
+import { openProcedureDialog } from './dialogs';
 
-type ActiveView = 'data' | 'variable';
+type ActiveView = 'data' | 'variable' | 'output';
+
+/** Procedures wired to "menu:analyze:<id>" events from the native menu. */
+const ANALYZE_PROCEDURES = [
+  'frequencies',
+  'descriptives',
+  'ttest_one_sample',
+  'ttest_independent',
+  'ttest_paired',
+  'anova_oneway',
+  'correlate',
+  'regression_linear',
+  'mann_whitney',
+  'wilcoxon',
+  'kruskal_wallis',
+  'chi_square',
+];
 
 export class App {
   private dataView = new DataView();
   private variableView = new VariableView();
+  private outputView = new OutputView();
   private statusBar = new StatusBar();
   private fileExplorer = new FileExplorer();
   private activeView: ActiveView = 'data';
@@ -18,13 +37,28 @@ export class App {
   mount(): void {
     this.dataView.mount(document.getElementById('pane-data')!);
     this.variableView.mount(document.getElementById('pane-variable')!, () => this.dataView.refresh());
+    this.outputView.mount(document.getElementById('pane-output')!);
     this.statusBar.mount(document.getElementById('status-bar-host')!);
     this.fileExplorer.mount(document.getElementById('sidebar')!, (path) => this.openFilePath(path));
 
     this.bindTabs();
     this.bindMenuEvents();
+    this.bindAnalyzeMenu();
     this.bindToolbar();
     this.restoreSidebarState();
+  }
+
+  // ── Analyze menu ────────────────────────────────────────────────────────────
+
+  private bindAnalyzeMenu(): void {
+    ANALYZE_PROCEDURES.forEach((proc) => {
+      window.electron.menu.on(`menu:analyze:${proc}`, () =>
+        openProcedureDialog(proc, () => {
+          this.switchView('output');
+          this.outputView.scrollToBottom();
+        }),
+      );
+    });
   }
 
   // ── Sidebar ───────────────────────────────────────────────────────────────
@@ -66,6 +100,7 @@ export class App {
     });
     document.getElementById('pane-data')!.style.display = view === 'data' ? 'flex' : 'none';
     document.getElementById('pane-variable')!.style.display = view === 'variable' ? 'flex' : 'none';
+    document.getElementById('pane-output')!.style.display = view === 'output' ? 'flex' : 'none';
   }
 
   // ── Toolbar ───────────────────────────────────────────────────────────────

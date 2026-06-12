@@ -1,4 +1,5 @@
 import type { LoadResult, Variable } from './types/dataset';
+import type { Analysis } from './types/analysis';
 
 // This file imports types, making it a module. To augment the global `Window`
 // from a module the declaration must live inside `declare global`.
@@ -17,10 +18,14 @@ declare global {
     };
 
     data: {
-      getPage(offset: number, limit: number): Promise<{ rows: Record<string, unknown>[]; total: number }>;
+      getPage(offset: number, limit: number, search?: string): Promise<{ rows: Record<string, unknown>[]; total: number }>;
       getVariables(): Promise<{ variables: Variable[] }>;
       setVariableMeta(varName: string, meta: Partial<Variable>): Promise<{ ok: boolean }>;
       updateCell(row: number, col: string, value: unknown): Promise<{ ok: boolean }>;
+    };
+
+    analysis: {
+      run(procedure: string, params: Record<string, unknown>): Promise<Analysis>;
     };
 
     fs: {

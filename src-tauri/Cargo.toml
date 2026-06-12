@@ -24,6 +24,7 @@ polars = { version = "0.45", default-features = false, features = [
     "lazy",
     "fmt",
     "strings",
+    "regex",
     "round_series",
 ] }
 ambers = "0.4.2"

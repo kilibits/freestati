@@ -64,8 +64,12 @@ const electron = {
 
   // ── Dataset data access ─────────────────────────────────────────────────────
   data: {
-    async getPage(offset: number, limit: number): Promise<{ rows: Record<string, unknown>[]; total: number }> {
-      const res = await invoke<{ rows_raw: string; total: number }>('get_page', { offset, limit });
+    async getPage(
+      offset: number,
+      limit: number,
+      query?: string,
+    ): Promise<{ rows: Record<string, unknown>[]; total: number }> {
+      const res = await invoke<{ rows_raw: string; total: number }>('get_page', { offset, limit, query });
       return { rows: JSON.parse(res.rows_raw), total: res.total };
     },
     getVariables: () => invoke('get_variables'),
@@ -73,6 +77,12 @@ const electron = {
       invoke('set_variable_meta', { name: varName, meta }),
     updateCell: (row: number, col: string, value: unknown) =>
       invoke('update_cell', { row, col, value }),
+  },
+
+  // ── Statistical procedures ──────────────────────────────────────────────────
+  analysis: {
+    run: (procedure: string, params: Record<string, unknown>) =>
+      invoke('run_analysis', { procedure, params }),
   },
 
   // ── Generic command pass-through (e.g. python.execute('new_dataset')) ───────

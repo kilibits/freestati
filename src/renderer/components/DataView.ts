@@ -18,18 +18,58 @@ ModuleRegistry.registerModules([AllCommunityModule, InfiniteRowModelModule]);
 
 export class DataView {
   private container!: HTMLElement;
+  private gridContainer!: HTMLElement;
   private api: GridApi | null = null;
   private unsub: (() => void) | null = null;
   // Identity of the dataset currently shown; avoids rebuilding the grid on
   // unrelated store updates (e.g. the "modified" flag toggling after an edit).
   private loadedSignature: string | null = null;
 
+  private searchQuery = '';
+  private searchTimer: number | null = null;
+
   mount(container: HTMLElement): void {
     this.container = container;
     this.container.classList.add('data-view-container');
+    this.container.style.display = 'flex';
+    this.container.style.flexDirection = 'column';
+
+    // ── Toolbar ──────────────────────────────────────────────────────────────
+    const toolbar = document.createElement('div');
+    toolbar.className = 'view-toolbar';
+    toolbar.innerHTML = `
+      <div class="search-input-wrapper">
+        <span class="search-icon">🔍</span>
+        <input type="text" class="search-input" placeholder="Search in all columns..." />
+      </div>
+    `;
+    const input = toolbar.querySelector('input')!;
+    input.addEventListener('input', (e) => this.onSearchInput(e));
+    this.container.appendChild(toolbar);
+
+    // ── Grid Container ───────────────────────────────────────────────────────
+    this.gridContainer = document.createElement('div');
+    this.gridContainer.style.flex = '1';
+    this.gridContainer.style.width = '100%';
+    this.container.appendChild(this.gridContainer);
+
     // Start with an empty grid (no dataset loaded yet).
-    this.api = createGrid(this.container, this.gridOptions(100, [], undefined));
+    this.api = createGrid(this.gridContainer, this.gridOptions(100, [], undefined));
     this.unsub = dataStore.subscribe(() => this.onStoreChange());
+  }
+
+  private onSearchInput(e: Event): void {
+    const val = (e.target as HTMLInputElement).value;
+    this.searchQuery = val;
+
+    if (this.searchTimer) window.clearTimeout(this.searchTimer);
+    this.searchTimer = window.setTimeout(() => {
+      if (!this.api) return;
+      const state = dataStore.get();
+      if (!state.loaded) return;
+      // Re-bind the datasource to trigger a fresh fetch from row 0 with the query.
+      this.api.setGridOption('datasource', this.buildDatasource(state.rowCount));
+    }, 250);
   }
 
   // ── Static grid options shared by every (re)build ──────────────────────────
@@ -111,7 +151,7 @@ export class DataView {
   /** Destroy and recreate the grid — the only way to change cacheBlockSize. */
   private rebuild(blockSize: number, columnDefs: ColDef[], datasource: IDatasource | undefined): void {
     this.api?.destroy();
-    this.api = createGrid(this.container, this.gridOptions(blockSize, columnDefs, datasource));
+    this.api = createGrid(this.gridContainer, this.gridOptions(blockSize, columnDefs, datasource));
   }
 
   // ── Builders ───────────────────────────────────────────────────────────────
@@ -164,7 +204,7 @@ export class DataView {
         const offset = params.startRow;
         const limit = params.endRow - params.startRow;
         window.electron.data
-          .getPage(offset, limit)
+          .getPage(offset, limit, this.searchQuery)
           .then(({ rows, total }: { rows: Record<string, unknown>[]; total: number }) => {
             params.successCallback(rows, total);
           })

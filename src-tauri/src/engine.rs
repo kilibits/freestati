@@ -244,21 +244,56 @@ impl Engine {
         out
     }
 
-    pub fn get_page(&self, offset: usize, limit: usize) -> EResult<PageResult> {
+    pub fn get_page(&self, offset: usize, limit: usize, query: Option<String>) -> EResult<PageResult> {
         let Some(df) = &self.df else {
             return Ok(PageResult { rows_raw: "[]".into(), total: 0 });
         };
-        let total = df.height();
+
+        let query = query.filter(|s| !s.trim().is_empty());
+        let is_filtered = query.is_some();
+
+        let frame = if let Some(q) = query {
+            let q_lower = q.to_lowercase();
+            // Build an OR of "<col> as lowercase string contains <query>" across
+            // every original column. contains_literal avoids regex metachar issues.
+            let mut mask: Option<Expr> = None;
+            for name in df.get_column_names() {
+                let e = col(name.as_str())
+                    .cast(DataType::String)
+                    .str()
+                    .to_lowercase()
+                    .str()
+                    .contains_literal(lit(q_lower.clone()));
+                mask = Some(match mask {
+                    Some(m) => m.or(e),
+                    None => e,
+                });
+            }
+            // with_row_index stamps the ORIGINAL 1-based position as __row__ so
+            // edits on a filtered view still map back to the correct source row.
+            let lazy = df.clone().lazy().with_row_index("__row__", Some(1));
+            match mask {
+                Some(m) => lazy.filter(m).collect().map_err(map_err)?,
+                None => lazy.collect().map_err(map_err)?,
+            }
+        } else {
+            df.clone()
+        };
+
+        let total = frame.height();
         if offset >= total {
             return Ok(PageResult { rows_raw: "[]".into(), total });
         }
         let len = limit.min(total - offset);
-        let mut chunk = df.slice(offset as i64, len);
+        let mut chunk = frame.slice(offset as i64, len);
 
-        // 1-based case number column.
-        let row_nums: Vec<i64> = (0..len as i64).map(|i| offset as i64 + 1 + i).collect();
-        let row_col = Series::new("__row__".into(), row_nums);
-        chunk.with_column(row_col).map_err(map_err)?;
+        // Unfiltered: stamp the 1-based case number. Filtered frames already
+        // carry __row__ (the original index) from with_row_index above.
+        if !is_filtered {
+            let row_nums: Vec<i64> = (0..len as i64).map(|i| offset as i64 + 1 + i).collect();
+            let row_col = Series::new("__row__".into(), row_nums);
+            chunk.with_column(row_col).map_err(map_err)?;
+        }
 
         // Replace NaN/Inf in float columns with null so the JSON is valid.
         if !self.float_cols.is_empty() {

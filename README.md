@@ -8,6 +8,11 @@ alongside `.tsv` and `.csv`.
 ## Features
 
 - **SPSS-style data editor** — Data View and Variable View with inline editing
+- **Statistical procedures** — Descriptives, Frequencies, t-tests (one-sample,
+  independent, paired), one-way ANOVA, correlation (Pearson/Spearman), linear
+  regression, and nonparametric tests (Mann-Whitney U, Wilcoxon, Kruskal-Wallis,
+  chi-square), all computed natively in Rust
+- **Output viewer** — an SPSS-style results pane that accumulates procedure tables
 - **File Explorer sidebar** — open a whole folder and load datasets on demand
 - **Virtualized grid** — AG Grid infinite row model scrolls millions of rows without
   loading them all into the WebView
@@ -127,16 +132,18 @@ with real assets before shipping).
 ## Project layout
 
 ```
-src/renderer/              WebView UI (unchanged from the Electron build)
-├── components/            App, DataView, VariableView, FileExplorer, StatusBar
-├── stores/dataStore.ts    reactive dataset state
-├── types/dataset.ts       shared types
+src/renderer/              WebView UI
+├── components/            App, DataView, VariableView, OutputView, FileExplorer,
+│                          StatusBar, dialogs (analysis variable pickers)
+├── stores/                dataStore (dataset state) · outputStore (results)
+├── types/                 dataset.ts · analysis.ts (result tables)
 ├── bridge.ts              window.electron shim over Tauri invoke/events/dialog
 ├── global.d.ts            window.electron typings
 └── index.html · styles.css · renderer.ts
 src-tauri/                 Rust core
 ├── src/lib.rs             Tauri commands, native menu, app setup
 ├── src/engine.rs          Polars data engine + metadata/inference
+├── src/stats.rs           statistical procedures + p-value special functions
 ├── tauri.conf.json        window, bundle, build config
 ├── capabilities/          permission grants for the WebView
 └── Cargo.toml
@@ -146,9 +153,9 @@ scripts/build-renderer.mjs esbuild bundler
 ## Roadmap
 
 - Restore `.xlsx` / `.dta` / `.sas7bdat` reading and `.sav` writing in the Rust engine
-- Descriptive statistics, compare means, correlation & regression, nonparametrics
+- More procedures (crosstabs, factor analysis) and options (Levene's test, post-hoc)
 - Charts (histogram, bar, scatter, box plot)
-- Output viewer for results and pivot tables
+- Richer output viewer — pivot tables, export, copy to clipboard
 - Tauri auto-updater
 
 ## License

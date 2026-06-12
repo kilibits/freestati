@@ -1,5 +1,6 @@
 mod engine;
 mod sav;
+mod stats;
 
 use std::sync::Mutex;
 
@@ -104,8 +105,13 @@ fn new_dataset(state: State<EngineState>) -> LoadResult {
 }
 
 #[tauri::command]
-fn get_page(state: State<EngineState>, offset: usize, limit: usize) -> Result<PageResult, String> {
-    state.lock().unwrap().get_page(offset, limit)
+fn get_page(
+    state: State<EngineState>,
+    offset: usize,
+    limit: usize,
+    query: Option<String>,
+) -> Result<PageResult, String> {
+    state.lock().unwrap().get_page(offset, limit, query)
 }
 
 #[tauri::command]
@@ -136,6 +142,17 @@ fn update_cell(
 fn save_file(state: State<EngineState>, path: String) -> Result<JsonValue, String> {
     state.lock().unwrap().save_file(&path)?;
     Ok(json!({ "ok": true, "path": path }))
+}
+
+// ── Statistical procedures ──────────────────────────────────────────────────
+
+#[tauri::command]
+fn run_analysis(
+    state: State<EngineState>,
+    procedure: String,
+    params: JsonValue,
+) -> Result<stats::Analysis, String> {
+    state.lock().unwrap().run_analysis(&procedure, &params)
 }
 
 // ── Native menu ─────────────────────────────────────────────────────────────
@@ -173,16 +190,29 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         .item(&PredefinedMenuItem::select_all(app, None)?)
         .build()?;
 
-    // Analyze (placeholders until procedures land)
+    // Analyze — emits "menu:analyze:<id>" to the renderer, which opens a dialog.
+    let nonparametric = SubmenuBuilder::new(app, "Nonparametric Tests")
+        .item(&mi("menu:analyze:mann_whitney", "2 Independent Samples (Mann-Whitney U)…", None)?)
+        .item(&mi("menu:analyze:wilcoxon", "2 Related Samples (Wilcoxon)…", None)?)
+        .item(&mi("menu:analyze:kruskal_wallis", "K Independent Samples (Kruskal-Wallis)…", None)?)
+        .item(&mi("menu:analyze:chi_square", "Chi-Square…", None)?)
+        .build()?;
+
+    let compare_means = SubmenuBuilder::new(app, "Compare Means")
+        .item(&mi("menu:analyze:ttest_one_sample", "One-Sample T Test…", None)?)
+        .item(&mi("menu:analyze:ttest_independent", "Independent-Samples T Test…", None)?)
+        .item(&mi("menu:analyze:ttest_paired", "Paired-Samples T Test…", None)?)
+        .item(&mi("menu:analyze:anova_oneway", "One-Way ANOVA…", None)?)
+        .build()?;
+
     let analyze = SubmenuBuilder::new(app, "Analyze")
-        .item(&disabled("an:freq", "Frequencies…")?)
-        .item(&disabled("an:desc", "Descriptives…")?)
-        .item(&disabled("an:cross", "Crosstabs…")?)
+        .item(&mi("menu:analyze:frequencies", "Frequencies…", None)?)
+        .item(&mi("menu:analyze:descriptives", "Descriptives…", None)?)
         .separator()
-        .item(&disabled("an:ttest", "T Tests…")?)
-        .item(&disabled("an:anova", "One-Way ANOVA…")?)
-        .item(&disabled("an:corr", "Correlate…")?)
-        .item(&disabled("an:reg", "Linear Regression…")?)
+        .item(&compare_means)
+        .item(&mi("menu:analyze:correlate", "Correlate…", None)?)
+        .item(&mi("menu:analyze:regression_linear", "Linear Regression…", None)?)
+        .item(&nonparametric)
         .build()?;
 
     // Graphs (placeholders)
@@ -257,6 +287,7 @@ pub fn run() {
             set_variable_meta,
             update_cell,
             save_file,
+            run_analysis,
         ])
         .run(tauri::generate_context!())
         .expect("error while running FreeStati");

@@ -312,6 +312,270 @@ html, body, #app {
   animation: spin 0.7s linear infinite;
 }
 
+/* ── View Toolbar ────────────────────────────────────────────────────────── */
+.view-toolbar {
+  height: 34px;
+  display: flex;
+  align-items: center;
+  padding: 0 10px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  gap: 8px;
+  flex-shrink: 0;
+}
+.search-input-wrapper {
+  position: relative;
+  flex: 1;
+  max-width: 300px;
+}
+.search-input {
+  width: 100%;
+  height: 24px;
+  padding: 0 8px 0 24px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font-size: 11px;
+}
+.search-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.search-icon {
+  position: absolute;
+  left: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--text-muted);
+  font-size: 11px;
+  pointer-events: none;
+}
+
 @keyframes spin {
   to { transform: rotate(360deg); }
 }
+
+/* ── Output viewer ─────────────────────────────────────────────────────────── */
+.output-view {
+  flex-direction: column;
+  height: 100%;
+}
+.output-toolbar {
+  display: flex;
+  align-items: center;
+  padding: 6px 10px;
+}
+.output-clear-btn {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 4px 10px;
+  font-size: 11px;
+  cursor: pointer;
+  font-family: var(--font);
+}
+.output-clear-btn:hover { background: var(--accent); border-color: var(--accent); }
+.output-body {
+  flex: 1;
+  overflow: auto;
+  padding: 16px 20px 40px;
+}
+.output-empty {
+  color: var(--text-muted);
+  font-size: 12px;
+  padding: 24px 8px;
+}
+.output-block {
+  margin-bottom: 28px;
+}
+.output-heading {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+  margin: 0 0 12px;
+  padding-bottom: 6px;
+  border-bottom: 2px solid var(--accent);
+}
+.output-table-wrap { margin: 0 0 18px; }
+.output-table-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 5px;
+}
+.output-table {
+  border-collapse: collapse;
+  font-size: 11px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+}
+.output-table th,
+.output-table td {
+  border: 1px solid var(--border);
+  padding: 4px 10px;
+  text-align: left;
+  white-space: nowrap;
+}
+.output-table th {
+  background: var(--surface2);
+  font-weight: 600;
+}
+.output-table th.num,
+.output-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.output-table td.label { color: var(--text); font-weight: 500; }
+.output-footnote {
+  font-size: 10px;
+  color: var(--text-muted);
+  margin-top: 4px;
+  font-style: italic;
+}
+
+/* ── Analysis dialogs ──────────────────────────────────────────────────────── */
+.dialog-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+.dialog {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  min-width: 480px;
+  max-width: 90vw;
+  max-height: 85vh;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 12px 48px rgba(0, 0, 0, 0.5);
+}
+.dialog-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.dialog-body {
+  padding: 14px 16px;
+  overflow: auto;
+}
+.dialog-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 10px 16px;
+  border-top: 1px solid var(--border);
+}
+.dialog-btn {
+  background: var(--surface2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 5px 16px;
+  font-size: 11px;
+  cursor: pointer;
+  font-family: var(--font);
+}
+.dialog-btn:hover { background: var(--border); }
+.dialog-ok { background: var(--accent); border-color: var(--accent); }
+.dialog-ok:hover { background: var(--accent-hover); }
+
+.var-mover {
+  display: flex;
+  gap: 10px;
+  align-items: stretch;
+}
+.var-col {
+  display: flex;
+  flex-direction: column;
+  min-width: 170px;
+}
+.var-col-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+}
+.var-list {
+  flex: 1;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  font-size: 11px;
+  font-family: var(--font);
+  padding: 2px;
+  min-height: 60px;
+}
+.var-list option { padding: 2px 6px; border-radius: 3px; }
+.var-list option:checked { background: var(--accent); color: #fff; }
+.var-targets {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  flex: 1;
+}
+.var-target-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.var-move-buttons {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.var-move-btn {
+  background: var(--surface2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  width: 28px;
+  height: 24px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.var-move-btn:hover { background: var(--accent); border-color: var(--accent); }
+
+.dialog-options {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  font-size: 11px;
+  color: var(--text);
+}
+.dialog-options-label {
+  width: 100%;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+.dialog-options label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
+.dialog-field { display: inline-flex; align-items: center; gap: 8px; }
+.dialog-input {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-size: 11px;
+  width: 90px;
+  font-family: var(--font);
+}
+.dialog-input:focus { outline: none; border-color: var(--accent); }
+
+.pairs-dialog { display: flex; flex-direction: column; gap: 10px; }
+.pairs-pickers { display: flex; gap: 10px; }
+.pairs-add { align-self: flex-start; }
