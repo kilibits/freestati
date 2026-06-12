@@ -1,0 +1,477 @@
+/**
+ * Analysis dialogs — SPSS-style variable pickers for each procedure.
+ *
+ * A small modal scaffold ([`createModal`]) plus a variable mover ([`VarMover`])
+ * back the config-driven dialogs in `SPECS`. Two procedures (paired t-test and
+ * Wilcoxon) need a pair builder, handled by [`openPairsDialog`]. On OK each
+ * dialog calls the Rust `run_analysis` command and appends the result to the
+ * output store.
+ */
+import { dataStore } from '../stores/dataStore';
+import { outputStore } from '../stores/outputStore';
+import type { Analysis } from '../types/analysis';
+import type { Variable } from '../types/dataset';
+
+// ── Modal scaffold ───────────────────────────────────────────────────────────
+
+interface Modal {
+  root: HTMLElement;
+  body: HTMLElement;
+  close: () => void;
+  /** Wire the OK button. The callback returns false to keep the modal open. */
+  onOk: (run: () => boolean | Promise<boolean>) => void;
+}
+
+function createModal(title: string): Modal {
+  const overlay = document.createElement('div');
+  overlay.className = 'dialog-overlay';
+
+  const dialog = document.createElement('div');
+  dialog.className = 'dialog';
+  dialog.innerHTML = `
+    <div class="dialog-title">${escapeHtml(title)}</div>
+    <div class="dialog-body"></div>
+    <div class="dialog-footer">
+      <button class="dialog-btn dialog-ok">OK</button>
+      <button class="dialog-btn dialog-cancel">Cancel</button>
+    </div>
+  `;
+  overlay.appendChild(dialog);
+  document.body.appendChild(overlay);
+
+  const close = () => overlay.remove();
+  overlay.addEventListener('mousedown', (e) => {
+    if (e.target === overlay) close();
+  });
+  dialog.querySelector('.dialog-cancel')!.addEventListener('click', close);
+
+  return {
+    root: dialog,
+    body: dialog.querySelector('.dialog-body') as HTMLElement,
+    close,
+    onOk(run) {
+      dialog.querySelector('.dialog-ok')!.addEventListener('click', () => {
+        void Promise.resolve(run()).then((ok) => {
+          if (ok) close();
+        });
+      });
+    },
+  };
+}
+
+// ── Variable mover (source list ⇄ target slots) ──────────────────────────────
+
+interface Slot {
+  key: string;
+  label: string;
+  /** false = single-variable slot (e.g. grouping variable, dependent). */
+  multiple: boolean;
+}
+
+class VarMover {
+  private source: HTMLSelectElement;
+  private targets = new Map<string, HTMLSelectElement>();
+
+  constructor(container: HTMLElement, variables: Variable[], slots: Slot[]) {
+    const grid = document.createElement('div');
+    grid.className = 'var-mover';
+
+    // Source list.
+    const srcWrap = document.createElement('div');
+    srcWrap.className = 'var-col';
+    srcWrap.innerHTML = `<div class="var-col-label">Variables</div>`;
+    this.source = listBox();
+    variables.forEach((v) => this.source.appendChild(option(v)));
+    srcWrap.appendChild(this.source);
+    grid.appendChild(srcWrap);
+
+    // Target slots stacked on the right, each with move buttons.
+    const right = document.createElement('div');
+    right.className = 'var-targets';
+    slots.forEach((slot) => {
+      const row = document.createElement('div');
+      row.className = 'var-target-row';
+
+      const buttons = document.createElement('div');
+      buttons.className = 'var-move-buttons';
+      const add = button('→', () => this.move(slot));
+      const remove = button('←', () => this.unmove(slot));
+      buttons.append(add, remove);
+
+      const col = document.createElement('div');
+      col.className = 'var-col';
+      col.innerHTML = `<div class="var-col-label">${escapeHtml(slot.label)}</div>`;
+      const box = listBox();
+      if (!slot.multiple) box.size = 1;
+      this.targets.set(slot.key, box);
+      col.appendChild(box);
+
+      row.append(buttons, col);
+      right.appendChild(row);
+    });
+    grid.appendChild(right);
+    container.appendChild(grid);
+  }
+
+  private move(slot: Slot): void {
+    const target = this.targets.get(slot.key)!;
+    const selected = Array.from(this.source.selectedOptions);
+    if (selected.length === 0) return;
+    const toMove = slot.multiple ? selected : selected.slice(0, 1);
+    // Single-capacity slot: return any existing occupant to the source first.
+    if (!slot.multiple) {
+      Array.from(target.options).forEach((o) => this.source.appendChild(o));
+    }
+    toMove.forEach((o) => target.appendChild(o));
+    sortOptions(this.source);
+  }
+
+  private unmove(slot: Slot): void {
+    const target = this.targets.get(slot.key)!;
+    Array.from(target.selectedOptions).forEach((o) => this.source.appendChild(o));
+    sortOptions(this.source);
+  }
+
+  values(key: string): string[] {
+    return Array.from(this.targets.get(key)!.options).map((o) => o.value);
+  }
+}
+
+// ── Dialog specs (config-driven, common shapes) ──────────────────────────────
+
+interface DialogSpec {
+  title: string;
+  procedure: string;
+  slots: Slot[];
+  /** Extra option controls appended below the mover. */
+  extras?: (body: HTMLElement) => void;
+  /** Build params from the mover + body; return an error string to block OK. */
+  collect: (mover: VarMover, body: HTMLElement) => Record<string, unknown> | string;
+}
+
+const SPECS: Record<string, DialogSpec> = {
+  descriptives: {
+    title: 'Descriptives',
+    procedure: 'descriptives',
+    slots: [{ key: 'vars', label: 'Variable(s)', multiple: true }],
+    collect: (m) => requireVars(m, 'vars'),
+  },
+  frequencies: {
+    title: 'Frequencies',
+    procedure: 'frequencies',
+    slots: [{ key: 'vars', label: 'Variable(s)', multiple: true }],
+    collect: (m) => requireVars(m, 'vars'),
+  },
+  chi_square: {
+    title: 'Chi-Square Test',
+    procedure: 'chi_square',
+    slots: [{ key: 'vars', label: 'Test Variable(s)', multiple: true }],
+    collect: (m) => requireVars(m, 'vars'),
+  },
+  ttest_one_sample: {
+    title: 'One-Sample T Test',
+    procedure: 'ttest_one_sample',
+    slots: [{ key: 'vars', label: 'Test Variable(s)', multiple: true }],
+    extras: (b) => b.appendChild(numberField('Test Value', 'testValue', '0')),
+    collect: (m, b) => {
+      const vars = m.values('vars');
+      if (vars.length === 0) return 'Select at least one test variable.';
+      const raw = (b.querySelector('[data-key="testValue"]') as HTMLInputElement).value;
+      if (raw.trim() === '' || Number.isNaN(Number(raw))) return 'Enter a numeric test value.';
+      return { vars, testValue: Number(raw) };
+    },
+  },
+  ttest_independent: {
+    title: 'Independent-Samples T Test',
+    procedure: 'ttest_independent',
+    slots: [
+      { key: 'vars', label: 'Test Variable(s)', multiple: true },
+      { key: 'group', label: 'Grouping Variable', multiple: false },
+    ],
+    extras: groupValueFields,
+    collect: (m, b) => collectGrouped(m, b),
+  },
+  mann_whitney: {
+    title: 'Two Independent Samples (Mann-Whitney U)',
+    procedure: 'mann_whitney',
+    slots: [
+      { key: 'vars', label: 'Test Variable(s)', multiple: true },
+      { key: 'group', label: 'Grouping Variable', multiple: false },
+    ],
+    extras: groupValueFields,
+    collect: (m, b) => collectGrouped(m, b),
+  },
+  anova_oneway: {
+    title: 'One-Way ANOVA',
+    procedure: 'anova_oneway',
+    slots: [
+      { key: 'vars', label: 'Dependent List', multiple: true },
+      { key: 'factor', label: 'Factor', multiple: false },
+    ],
+    collect: (m) => collectFactor(m),
+  },
+  kruskal_wallis: {
+    title: 'K Independent Samples (Kruskal-Wallis)',
+    procedure: 'kruskal_wallis',
+    slots: [
+      { key: 'vars', label: 'Test Variable List', multiple: true },
+      { key: 'factor', label: 'Grouping Variable', multiple: false },
+    ],
+    collect: (m) => collectFactor(m),
+  },
+  correlate: {
+    title: 'Bivariate Correlations',
+    procedure: 'correlate',
+    slots: [{ key: 'vars', label: 'Variables', multiple: true }],
+    extras: (b) => {
+      const fs = document.createElement('div');
+      fs.className = 'dialog-options';
+      fs.innerHTML = `
+        <div class="dialog-options-label">Correlation Coefficients</div>
+        <label><input type="radio" name="corr-method" value="pearson" checked /> Pearson</label>
+        <label><input type="radio" name="corr-method" value="spearman" /> Spearman</label>`;
+      b.appendChild(fs);
+    },
+    collect: (m, b) => {
+      const vars = m.values('vars');
+      if (vars.length < 2) return 'Select at least two variables.';
+      const method =
+        (b.querySelector('input[name="corr-method"]:checked') as HTMLInputElement)?.value ??
+        'pearson';
+      return { vars, method };
+    },
+  },
+  regression_linear: {
+    title: 'Linear Regression',
+    procedure: 'regression_linear',
+    slots: [
+      { key: 'dependent', label: 'Dependent', multiple: false },
+      { key: 'independents', label: 'Independent(s)', multiple: true },
+    ],
+    collect: (m) => {
+      const dep = m.values('dependent');
+      const indep = m.values('independents');
+      if (dep.length !== 1) return 'Select exactly one dependent variable.';
+      if (indep.length === 0) return 'Select at least one independent variable.';
+      return { dependent: dep[0], independents: indep };
+    },
+  },
+};
+
+// ── Public entry point ───────────────────────────────────────────────────────
+
+/** Open the dialog for `procedure`. `onDone` runs after a result is produced. */
+export function openProcedureDialog(procedure: string, onDone: () => void): void {
+  if (!dataStore.get().loaded) {
+    alert('Open a dataset before running an analysis.');
+    return;
+  }
+  if (procedure === 'ttest_paired') {
+    openPairsDialog('ttest_paired', 'Paired-Samples T Test', onDone);
+    return;
+  }
+  if (procedure === 'wilcoxon') {
+    openPairsDialog('wilcoxon', 'Two Related Samples (Wilcoxon)', onDone);
+    return;
+  }
+  const spec = SPECS[procedure];
+  if (!spec) {
+    alert(`Procedure not available: ${procedure}`);
+    return;
+  }
+  openSpecDialog(spec, onDone);
+}
+
+function openSpecDialog(spec: DialogSpec, onDone: () => void): void {
+  const variables = dataStore.get().variables;
+  const modal = createModal(spec.title);
+  const mover = new VarMover(modal.body, variables, spec.slots);
+  spec.extras?.(modal.body);
+
+  modal.onOk(async () => {
+    const params = spec.collect(mover, modal.body);
+    if (typeof params === 'string') {
+      alert(params);
+      return false;
+    }
+    return runProcedure(spec.procedure, params, onDone);
+  });
+}
+
+// ── Pairs dialog (paired t-test, Wilcoxon) ───────────────────────────────────
+
+function openPairsDialog(procedure: string, title: string, onDone: () => void): void {
+  const variables = dataStore.get().variables;
+  const modal = createModal(title);
+
+  const wrap = document.createElement('div');
+  wrap.className = 'pairs-dialog';
+  wrap.innerHTML = `
+    <div class="pairs-pickers">
+      <div class="var-col">
+        <div class="var-col-label">Variable 1</div>
+      </div>
+      <div class="var-col">
+        <div class="var-col-label">Variable 2</div>
+      </div>
+    </div>
+    <button class="dialog-btn pairs-add">Add Pair →</button>
+    <div class="var-col">
+      <div class="var-col-label">Paired Variables</div>
+    </div>`;
+  const cols = wrap.querySelectorAll('.var-col');
+  const sel1 = listBox();
+  sel1.size = 6;
+  const sel2 = listBox();
+  sel2.size = 6;
+  variables.forEach((v) => {
+    sel1.appendChild(option(v));
+    sel2.appendChild(option(v));
+  });
+  cols[0].appendChild(sel1);
+  cols[1].appendChild(sel2);
+
+  const pairsBox = listBox();
+  pairsBox.size = 5;
+  cols[2].appendChild(pairsBox);
+
+  const pairs: [string, string][] = [];
+  wrap.querySelector('.pairs-add')!.addEventListener('click', () => {
+    const a = sel1.value;
+    const b = sel2.value;
+    if (!a || !b || a === b) {
+      alert('Pick two different variables.');
+      return;
+    }
+    pairs.push([a, b]);
+    const opt = document.createElement('option');
+    opt.textContent = `${a} — ${b}`;
+    pairsBox.appendChild(opt);
+  });
+  // Double-click a pair to remove it.
+  pairsBox.addEventListener('dblclick', () => {
+    const i = pairsBox.selectedIndex;
+    if (i >= 0) {
+      pairs.splice(i, 1);
+      pairsBox.remove(i);
+    }
+  });
+  modal.body.appendChild(wrap);
+
+  modal.onOk(async () => {
+    if (pairs.length === 0) {
+      alert('Add at least one pair.');
+      return false;
+    }
+    return runProcedure(procedure, { pairs }, onDone);
+  });
+}
+
+// ── Shared collect helpers ───────────────────────────────────────────────────
+
+function requireVars(m: VarMover, key: string): Record<string, unknown> | string {
+  const vars = m.values(key);
+  if (vars.length === 0) return 'Select at least one variable.';
+  return { [key]: vars };
+}
+
+function collectFactor(m: VarMover): Record<string, unknown> | string {
+  const vars = m.values('vars');
+  const factor = m.values('factor');
+  if (vars.length === 0) return 'Select at least one test variable.';
+  if (factor.length !== 1) return 'Select one grouping/factor variable.';
+  return { vars, factor: factor[0] };
+}
+
+function collectGrouped(m: VarMover, b: HTMLElement): Record<string, unknown> | string {
+  const vars = m.values('vars');
+  const group = m.values('group');
+  if (vars.length === 0) return 'Select at least one test variable.';
+  if (group.length !== 1) return 'Select one grouping variable.';
+  const g1 = (b.querySelector('[data-key="group1"]') as HTMLInputElement).value.trim();
+  const g2 = (b.querySelector('[data-key="group2"]') as HTMLInputElement).value.trim();
+  if (g1 === '' || g2 === '') return 'Enter both group values.';
+  return { vars, group: group[0], group1: g1, group2: g2 };
+}
+
+function groupValueFields(b: HTMLElement): void {
+  const fs = document.createElement('div');
+  fs.className = 'dialog-options';
+  fs.innerHTML = `<div class="dialog-options-label">Define Groups</div>`;
+  fs.appendChild(numberRow('Group 1 value', 'group1'));
+  fs.appendChild(numberRow('Group 2 value', 'group2'));
+  b.appendChild(fs);
+}
+
+// ── Execution ────────────────────────────────────────────────────────────────
+
+async function runProcedure(
+  procedure: string,
+  params: Record<string, unknown>,
+  onDone: () => void,
+): Promise<boolean> {
+  try {
+    const result = await window.electron.analysis.run(procedure, params);
+    outputStore.append(result as Analysis);
+    onDone();
+    return true;
+  } catch (err) {
+    alert(`Analysis failed:\n${err}`);
+    return false;
+  }
+}
+
+// ── Small DOM helpers ────────────────────────────────────────────────────────
+
+function listBox(): HTMLSelectElement {
+  const sel = document.createElement('select');
+  sel.multiple = true;
+  sel.className = 'var-list';
+  sel.size = 8;
+  return sel;
+}
+
+function option(v: Variable): HTMLOptionElement {
+  const o = document.createElement('option');
+  o.value = v.name;
+  o.textContent = v.label ? `${v.label} [${v.name}]` : v.name;
+  return o;
+}
+
+function sortOptions(sel: HTMLSelectElement): void {
+  const opts = Array.from(sel.options);
+  opts.sort((a, b) => a.text.localeCompare(b.text));
+  opts.forEach((o) => sel.appendChild(o));
+}
+
+function button(label: string, onClick: () => void): HTMLButtonElement {
+  const btn = document.createElement('button');
+  btn.className = 'var-move-btn';
+  btn.textContent = label;
+  btn.addEventListener('click', onClick);
+  return btn;
+}
+
+function numberField(label: string, key: string, def: string): HTMLElement {
+  const wrap = document.createElement('div');
+  wrap.className = 'dialog-options';
+  wrap.appendChild(numberRow(label, key, def));
+  return wrap;
+}
+
+function numberRow(label: string, key: string, def = ''): HTMLElement {
+  const row = document.createElement('label');
+  row.className = 'dialog-field';
+  row.innerHTML = `<span>${escapeHtml(label)}</span>`;
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.dataset['key'] = key;
+  input.value = def;
+  input.className = 'dialog-input';
+  row.appendChild(input);
+  return row;
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]!));
+}
