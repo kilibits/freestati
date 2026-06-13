@@ -102,6 +102,14 @@ select.toolbar-btn {
   background-size: 12px;
 }
 
+/* Left group of analysis dropdowns takes the space; edit toggle sits at right. */
+.toolbar-group { flex: 1; display: flex; align-items: center; gap: 4px; }
+/* Wrapper so the tooltip still shows while the inner control is disabled
+   (disabled controls receive no hover events, so their own title never fires). */
+.toolbar-item { display: inline-flex; align-items: center; }
+.toolbar-item.disabled { cursor: help; }
+.toolbar-item.disabled > * { pointer-events: none; opacity: 0.45; }
+
 /* ── Layout (sidebar + content) ───────────────────────────────────────────── */
 .layout {
   flex: 1;
@@ -393,6 +401,34 @@ select.toolbar-btn {
   font-size: 11px;
   pointer-events: none;
 }
+
+/* Column-filter dropdown + clear button in the Data View toolbar. */
+.column-filter {
+  height: 24px;
+  padding: 0 6px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font-size: 11px;
+  font-family: var(--font);
+  max-width: 180px;
+}
+.column-filter:focus { outline: none; border-color: var(--accent); }
+.clear-filter-btn {
+  height: 24px;
+  padding: 0 10px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-family: var(--font);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.clear-filter-btn:hover { color: var(--text); border-color: var(--accent); }
+.clear-filter-btn[hidden] { display: none; }
 
 @keyframes spin {
   to { transform: rotate(360deg); }

@@ -26,8 +26,12 @@ export class DataView {
   private loadedSignature: string | null = null;
 
   private searchQuery = '';
+  private searchColumn = '';
   private searchTimer: number | null = null;
   private loadedEditMode = false;
+  private searchInput!: HTMLInputElement;
+  private filterSelect!: HTMLSelectElement;
+  private clearBtn!: HTMLButtonElement;
 
   mount(container: HTMLElement): void {
     this.container = container;
@@ -41,19 +45,19 @@ export class DataView {
     toolbar.innerHTML = `
       <div class="search-input-wrapper">
         <span class="search-icon">🔍</span>
-        <input type="text" class="search-input" placeholder="Search in all columns..." />
+        <input type="text" class="search-input" placeholder="Search…" />
       </div>
-      <select class="column-filter" style="margin-left: 8px; padding: 4px;">
-        <option value="">All Columns</option>
+      <select class="column-filter" title="Limit the search to one column">
+        <option value="">All columns</option>
       </select>
+      <button class="clear-filter-btn" title="Clear search and column filter" hidden>✕ Clear</button>
     `;
-    const input = toolbar.querySelector('input')!;
-    input.addEventListener('input', (e) => this.onSearchInput(e));
-    
-    const select = toolbar.querySelector('select')!;
-    select.addEventListener('change', () => {
-        this.onSearchInput({ target: input } as any);
-    });
+    this.searchInput = toolbar.querySelector('input')!;
+    this.filterSelect = toolbar.querySelector('select')!;
+    this.clearBtn = toolbar.querySelector('button')!;
+    this.searchInput.addEventListener('input', () => this.onSearchInput());
+    this.filterSelect.addEventListener('change', () => this.onFilterChange());
+    this.clearBtn.addEventListener('click', () => this.clearFilters());
     this.container.appendChild(toolbar);
 
     // ── Grid Container ───────────────────────────────────────────────────────
@@ -67,18 +71,50 @@ export class DataView {
     this.unsub = dataStore.subscribe(() => this.onStoreChange());
   }
 
-  private onSearchInput(e: Event): void {
-    const val = (e.target as HTMLInputElement).value;
-    this.searchQuery = val;
-
+  private onSearchInput(): void {
+    this.searchQuery = this.searchInput.value;
+    this.updateClearButton();
+    // Debounce: re-fetch from row 0 with the new query after typing settles.
     if (this.searchTimer) window.clearTimeout(this.searchTimer);
-    this.searchTimer = window.setTimeout(() => {
-      if (!this.api) return;
-      const state = dataStore.get();
-      if (!state.loaded) return;
-      // Re-bind the datasource to trigger a fresh fetch from row 0 with the query.
-      this.api.setGridOption('datasource', this.buildDatasource(state.rowCount));
-    }, 250);
+    this.searchTimer = window.setTimeout(() => this.applySearch(), 250);
+  }
+
+  private onFilterChange(): void {
+    this.searchColumn = this.filterSelect.value;
+    this.updateClearButton();
+    this.applySearch(); // column change takes effect immediately
+  }
+
+  private clearFilters(): void {
+    this.searchInput.value = '';
+    this.filterSelect.value = '';
+    this.searchQuery = '';
+    this.searchColumn = '';
+    this.updateClearButton();
+    this.applySearch();
+  }
+
+  /** Re-bind the datasource so AG Grid re-fetches page 0 with the current query. */
+  private applySearch(): void {
+    if (!this.api) return;
+    const state = dataStore.get();
+    if (!state.loaded) return;
+    this.api.setGridOption('datasource', this.buildDatasource(state.rowCount));
+  }
+
+  private updateClearButton(): void {
+    this.clearBtn.hidden = this.searchQuery === '' && this.searchColumn === '';
+  }
+
+  /** Fill the column-filter dropdown with the dataset's variables and reset it. */
+  private populateColumnFilter(variables: Variable[]): void {
+    const options = ['<option value="">All columns</option>'];
+    for (const v of variables) {
+      const name = v.name.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      options.push(`<option value="${name}">${name}</option>`);
+    }
+    this.filterSelect.innerHTML = options.join('');
+    this.filterSelect.value = '';
   }
 
   // ── Static grid options shared by every (re)build ──────────────────────────
@@ -129,6 +165,8 @@ export class DataView {
     if (!state.loaded) {
       if (this.loadedSignature !== null) {
         this.loadedSignature = null;
+        this.clearFilters();
+        this.populateColumnFilter([]);
         this.rebuild(100, [], undefined);
       }
       return;
@@ -145,6 +183,13 @@ export class DataView {
       return;
     }
     this.loadedSignature = signature;
+
+    // New dataset: reset any prior search/filter and repopulate the column list.
+    this.searchInput.value = '';
+    this.searchQuery = '';
+    this.searchColumn = '';
+    this.updateClearButton();
+    this.populateColumnFilter(state.variables);
     this.loadedEditMode = state.editMode;
 
     const blockSize = this.blockSizeFor(state.variables.length);
@@ -215,14 +260,14 @@ export class DataView {
   }
 
   private buildDatasource(rowCount: number): IDatasource {
-    const colFilter = (this.container.querySelector('.column-filter') as HTMLSelectElement)?.value;
+    const colFilter = this.searchColumn || undefined;
     return {
       rowCount,
       getRows: (params: IGetRowsParams) => {
         const offset = params.startRow;
         const limit = params.endRow - params.startRow;
         window.electron.data
-          .getPage(offset, limit, this.searchQuery, colFilter || undefined)
+          .getPage(offset, limit, this.searchQuery, colFilter)
           .then(({ rows, total }: { rows: Record<string, unknown>[]; total: number }) => {
             params.successCallback(rows, total);
           })

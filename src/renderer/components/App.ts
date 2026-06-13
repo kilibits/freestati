@@ -38,6 +38,40 @@ const ANALYZE_PROCEDURES = [
 /** Charts wired to "menu:graph:<kind>" events from the native menu. */
 const GRAPH_KINDS = ['histogram', 'bar', 'clustered_bar', 'line', 'scatter', 'box'];
 
+/** Human-readable labels for the toolbar dropdowns (match the menu wording). */
+const PROC_LABELS: Record<string, string> = {
+  frequencies: 'Frequencies',
+  descriptives: 'Descriptives',
+  crosstabs: 'Crosstabs',
+  correlate: 'Correlate',
+  regression_linear: 'Linear Regression',
+  ttest_one_sample: 'One-Sample T Test',
+  ttest_independent: 'Independent-Samples T Test',
+  ttest_paired: 'Paired-Samples T Test',
+  anova_oneway: 'One-Way ANOVA',
+  glm_univariate: 'GLM Univariate',
+  glm_multivariate: 'GLM Multivariate (MANOVA)',
+  glm_repeated: 'Repeated Measures',
+  mixed_model: 'Linear Mixed Model',
+  factor: 'Factor Analysis',
+  reliability: 'Reliability Analysis',
+  survival_km: 'Kaplan-Meier',
+  cox_regression: 'Cox Regression',
+  mann_whitney: 'Mann-Whitney U',
+  wilcoxon: 'Wilcoxon',
+  kruskal_wallis: 'Kruskal-Wallis',
+  chi_square: 'Chi-Square',
+};
+
+const GRAPH_LABELS: Record<string, string> = {
+  histogram: 'Histogram',
+  bar: 'Bar Chart',
+  clustered_bar: 'Clustered Bar Chart',
+  line: 'Line Chart',
+  scatter: 'Scatter Plot',
+  box: 'Box Plot',
+};
+
 export class App {
   private dataView = new DataView();
   private variableView = new VariableView();
@@ -152,61 +186,54 @@ export class App {
       { name: 'Statistics', procs: ['frequencies', 'descriptives', 'correlate', 'regression_linear', 'crosstabs'] },
       { name: 'Compare Means', procs: ['ttest_one_sample', 'ttest_independent', 'ttest_paired', 'anova_oneway'] },
       { name: 'Advanced Models', procs: ['glm_univariate', 'glm_multivariate', 'glm_repeated', 'mixed_model', 'factor', 'reliability', 'survival_km', 'cox_regression'] },
-      { name: 'Nonparametric', procs: ['mann_whitney', 'wilcoxon', 'kruskal_wallis', 'chi_square'] }
+      { name: 'Nonparametric', procs: ['mann_whitney', 'wilcoxon', 'kruskal_wallis', 'chi_square'] },
     ];
 
-    const dropdowns: HTMLSelectElement[] = [];
-
-    categories.forEach(cat => {
-      const dropdown = document.createElement('select');
-      dropdown.className = 'toolbar-btn';
-      dropdown.innerHTML = `<option value="">${cat.name} ▾</option>`;
-      cat.procs.forEach(proc => {
+    // Each dropdown lives in a wrapper span. The select is truly `disabled`
+    // when no dataset is loaded; the tooltip lives on the wrapper because a
+    // disabled control receives no hover events (so its own title never shows).
+    const wrappers: HTMLElement[] = [];
+    const addDropdown = (label: string, entries: [string, string][], onPick: (v: string) => void) => {
+      const wrap = document.createElement('span');
+      wrap.className = 'toolbar-item';
+      const select = document.createElement('select');
+      select.className = 'toolbar-btn';
+      select.innerHTML = `<option value="">${label} ▾</option>`;
+      for (const [value, text] of entries) {
         const option = document.createElement('option');
-        option.value = proc;
-        option.textContent = proc.replace('_', ' ');
-        dropdown.appendChild(option);
-      });
-      dropdown.addEventListener('change', () => {
-        if (!dataStore.get().loaded) {
-            dropdown.value = "";
-            return;
-        }
-        if(dropdown.value) openProcedureDialog(dropdown.value, showOutput);
-        dropdown.value = "";
-      });
-      toolbar.appendChild(dropdown);
-      dropdowns.push(dropdown);
-    });
-
-    const graphDropdown = document.createElement('select');
-    graphDropdown.className = 'toolbar-btn';
-    graphDropdown.innerHTML = `<option value="">Graphs ▾</option>`;
-    GRAPH_KINDS.forEach(kind => {
-      const option = document.createElement('option');
-      option.value = kind;
-      option.textContent = kind.replace('_', ' ');
-      graphDropdown.appendChild(option);
-    });
-    graphDropdown.addEventListener('change', () => {
-      if (!dataStore.get().loaded) {
-          graphDropdown.value = "";
-          return;
+        option.value = value;
+        option.textContent = text;
+        select.appendChild(option);
       }
-      if(graphDropdown.value) openChartDialog(graphDropdown.value, showOutput);
-      graphDropdown.value = "";
-    });
-    toolbar.appendChild(graphDropdown);
-    dropdowns.push(graphDropdown);
+      select.addEventListener('change', () => {
+        if (select.value) onPick(select.value);
+        select.value = '';
+      });
+      wrap.appendChild(select);
+      toolbar.appendChild(wrap);
+      wrappers.push(wrap);
+    };
+
+    categories.forEach((cat) =>
+      addDropdown(
+        cat.name,
+        cat.procs.map((p) => [p, PROC_LABELS[p] ?? p]),
+        (v) => openProcedureDialog(v, showOutput),
+      ),
+    );
+    addDropdown(
+      'Graphs',
+      GRAPH_KINDS.map((k) => [k, GRAPH_LABELS[k] ?? k]),
+      (v) => openChartDialog(v, showOutput),
+    );
 
     const updateDisabledState = () => {
       const { loaded } = dataStore.get();
-      dropdowns.forEach(d => {
-        d.style.opacity = loaded ? '1' : '0.45';
-        d.style.cursor = loaded ? 'pointer' : 'help';
-        d.title = loaded ? '' : 'Open a dataset to enable analysis tools';
-        // Note: we can't fully disable without losing the tooltip, 
-        // so we prevent action in the event listener instead.
+      wrappers.forEach((wrap) => {
+        const select = wrap.querySelector('select')!;
+        select.disabled = !loaded;
+        wrap.classList.toggle('disabled', !loaded);
+        wrap.title = loaded ? '' : 'Open a dataset to enable analysis tools';
       });
     };
 
@@ -215,15 +242,22 @@ export class App {
   }
 
   private refreshEditToggle(): void {
+    const wrap = document.getElementById('edit-toggle-wrap');
     const toggle = document.getElementById('btn-edit-toggle') as HTMLButtonElement | null;
-    if (!toggle) return;
+    if (!toggle || !wrap) return;
     const { loaded, editMode } = dataStore.get();
     toggle.disabled = !loaded;
     toggle.textContent = editMode ? '🔓 Editing' : '🔒 Read-only';
     toggle.classList.toggle('active', editMode);
-    toggle.title = editMode
-      ? 'Editing enabled — click to make the dataset read-only'
-      : 'Dataset is read-only — click to allow editing';
+    wrap.classList.toggle('disabled', !loaded);
+    // Tooltip on the wrapper so it still shows while the button is disabled.
+    const tip = !loaded
+      ? 'Open a dataset to enable editing'
+      : editMode
+        ? 'Editing enabled — click to make the dataset read-only'
+        : 'Dataset is read-only — click to allow editing';
+    wrap.title = tip;
+    toggle.title = loaded ? tip : '';
   }
 
   // ── Native menu events ────────────────────────────────────────────────────
