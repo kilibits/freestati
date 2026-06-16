@@ -262,18 +262,26 @@ impl Engine {
                     .str()
                     .contains_literal(lit(q_lower)));
             } else {
-                for name in df.get_column_names() {
-                    let e = col(name.as_str())
-                        .cast(DataType::String)
+                // Concatenate every column into a single string per row and search
+                // that once. Building one flat `concat_str` node (N children) instead
+                // of an N-deep nested `OR` chain keeps the expression tree shallow —
+                // Polars walks it recursively, and a wide frame's deep OR tree
+                // overflows the tokio worker thread's small stack.
+                let cols: Vec<Expr> = df
+                    .get_column_names()
+                    .iter()
+                    .map(|name| col(name.as_str()).cast(DataType::String))
+                    .collect();
+                // `\x1f` (unit separator) won't appear in cell text, so it can't
+                // create a cross-column false match. ignore_nulls=true keeps a row
+                // searchable even when some cells are null.
+                mask = Some(
+                    concat_str(cols, "\x1f", true)
                         .str()
                         .to_lowercase()
                         .str()
-                        .contains_literal(lit(q_lower.clone()));
-                    mask = Some(match mask {
-                        Some(m) => m.or(e),
-                        None => e,
-                    });
-                }
+                        .contains_literal(lit(q_lower)),
+                );
             }
         }
 

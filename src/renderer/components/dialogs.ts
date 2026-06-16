@@ -73,15 +73,30 @@ interface Slot {
 class VarMover {
   private source: HTMLSelectElement;
   private targets = new Map<string, HTMLSelectElement>();
+  private filter = '';
 
   constructor(container: HTMLElement, variables: Variable[], slots: Slot[]) {
     const grid = document.createElement('div');
     grid.className = 'var-mover';
 
-    // Source list.
+    // Source list, with a search box above it that filters the visible options.
     const srcWrap = document.createElement('div');
     srcWrap.className = 'var-col';
     srcWrap.innerHTML = `<div class="var-col-label">Variables</div>`;
+
+    const searchWrap = document.createElement('div');
+    searchWrap.className = 'search-input-wrapper var-search';
+    searchWrap.innerHTML = `
+      <span class="search-icon">🔍</span>
+      <input type="text" class="search-input" placeholder="Search…" />
+    `;
+    const searchInput = searchWrap.querySelector('input')!;
+    searchInput.addEventListener('input', () => {
+      this.filter = searchInput.value.trim().toLowerCase();
+      this.applySourceFilter();
+    });
+    srcWrap.appendChild(searchWrap);
+
     this.source = listBox();
     variables.forEach((v) => this.source.appendChild(option(v)));
     srcWrap.appendChild(this.source);
@@ -124,14 +139,27 @@ class VarMover {
     if (!slot.multiple) {
       Array.from(target.options).forEach((o) => this.source.appendChild(o));
     }
-    toMove.forEach((o) => target.appendChild(o));
+    // Options in a target are always shown regardless of the source filter.
+    toMove.forEach((o) => {
+      o.hidden = false;
+      target.appendChild(o);
+    });
     sortOptions(this.source);
+    this.applySourceFilter();
   }
 
   private unmove(slot: Slot): void {
     const target = this.targets.get(slot.key)!;
     Array.from(target.selectedOptions).forEach((o) => this.source.appendChild(o));
     sortOptions(this.source);
+    this.applySourceFilter();
+  }
+
+  /** Hide source options that don't match the current search text. */
+  private applySourceFilter(): void {
+    Array.from(this.source.options).forEach((o) => {
+      o.hidden = this.filter !== '' && !o.text.toLowerCase().includes(this.filter);
+    });
   }
 
   values(key: string): string[] {

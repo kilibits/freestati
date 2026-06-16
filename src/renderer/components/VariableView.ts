@@ -90,13 +90,39 @@ export class VariableView {
     this.onChangeCb = onVariableChange;
     container.classList.add('variable-view-container');
 
+    // Search bar + grid stacked in a left column; detail panel sits to the right.
+    const gridCol = document.createElement('div');
+    gridCol.className = 'variable-grid-col';
+
+    const toolbar = document.createElement('div');
+    toolbar.className = 'view-toolbar';
+    toolbar.innerHTML = `
+      <div class="search-input-wrapper">
+        <span class="search-icon">🔍</span>
+        <input type="text" class="search-input" placeholder="Search variables…" />
+      </div>
+    `;
+    const searchInput = toolbar.querySelector('input')!;
+    searchInput.addEventListener('input', () => {
+      this.api?.setGridOption('quickFilterText', searchInput.value);
+    });
+    gridCol.appendChild(toolbar);
+
     const gridDiv = document.createElement('div');
     gridDiv.id = 'variable-grid';
-    container.appendChild(gridDiv);
+    gridCol.appendChild(gridDiv);
+    container.appendChild(gridCol);
 
     this.detailPanel = document.createElement('div');
     this.detailPanel.id = 'variable-detail';
-    this.detailPanel.innerHTML = '<div class="variable-detail-title">Selection Details</div><div class="variable-detail-content">Select a cell to see full value.</div>';
+    this.detailPanel.innerHTML = `
+      <div class="variable-detail-header">
+        <span class="variable-detail-title">Selection Details</span>
+        <button class="detail-collapse-btn" title="Collapse panel" aria-label="Collapse panel">⟩</button>
+      </div>
+      <div class="variable-detail-content">Select a cell to see full value.</div>`;
+    const collapseBtn = this.detailPanel.querySelector('.detail-collapse-btn') as HTMLButtonElement;
+    collapseBtn.addEventListener('click', () => this.toggleDetail());
     container.appendChild(this.detailPanel);
 
     this.api = createGrid<Variable>(gridDiv, {
@@ -128,6 +154,18 @@ export class VariableView {
     });
 
     this.unsub = dataStore.subscribe(() => this.onStoreChange());
+  }
+
+  private toggleDetail(): void {
+    if (!this.detailPanel) return;
+    const collapsed = this.detailPanel.classList.toggle('collapsed');
+    const btn = this.detailPanel.querySelector('.detail-collapse-btn') as HTMLButtonElement | null;
+    if (btn) {
+      btn.textContent = collapsed ? '⟨' : '⟩';
+      const action = collapsed ? 'Expand' : 'Collapse';
+      btn.title = `${action} panel`;
+      btn.setAttribute('aria-label', `${action} panel`);
+    }
   }
 
   private onCellFocused(event: any): void {

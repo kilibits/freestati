@@ -26,6 +26,7 @@ polars = { version = "0.45", default-features = false, features = [
     "strings",
     "regex",
     "round_series",
+    "concat_str",
 ] }
 ambers = "0.4.2"
 arrow = "57"
